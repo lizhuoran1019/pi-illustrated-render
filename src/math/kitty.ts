@@ -26,12 +26,15 @@
  * placements whenever its own images change) are tracked, so images and
  * placements are restored with the redrawn lines. Images are never deleted
  * on shutdown: placeholders left in the scrollback keep showing them after pi
- * exits. Without a hook (tests) images are sent when registered.
+ * exits. Unique PNG payloads share a bounded cache; per-ID geometry stays
+ * separate. A batch that exceeds capacity gets width-preserving text at the
+ * writer for its unavailable images, without invalidating rendered Markdown.
+ * Without a hook (tests) images are sent when registered.
  *
  * Diacritic table: kitty's rowcolumn-diacritics.txt (via Fadouse/pi-math, MIT).
  */
 import { getCapabilities, getCellDimensions, getPngDimensions } from "@earendil-works/pi-tui";
-import { bumpVersion } from "../state.ts";
+import { createHash } from "node:crypto";
 
 const DIACRITIC_CODE_POINTS = [
   0x305, 0x30d, 0x30e, 0x310, 0x312, 0x33d, 0x33e, 0x33f, 0x346, 0x34a, 0x34b, 0x34c,
@@ -161,8 +164,16 @@ export function deleteSequence(id: number): string {
 	return `\x1b_Ga=d,d=I,i=${id},q=2\x1b\\`;
 }
 
-interface ImageData {
+interface Payload {
+	key: string;
 	base64: string;
+	references: number;
+}
+
+interface ImageData {
+	payload: Payload;
+	/** Registrations in the current render batch cannot be evicted before its write. */
+	epoch: number;
 	columns: number;
 	rows: number;
 	/** Pixel size of the PNG (the image exactly covers columns×rows cells). */
@@ -184,42 +195,189 @@ export function setKittyWriter(fn: Writer | undefined): void {
 const REGISTRY_LIMIT = 4000;
 const REGISTRY_BYTES = 64 * 1024 * 1024;
 let registryBytes = 0;
+let registrationEpoch = 0;
 const registry = new Map<number, ImageData>();
-/** Images whose data the terminal has. */
+/** Equal PNG strings share storage/accounting, not placement or copy identity. */
+const payloads = new Map<string, Payload>();
+/** Compact content keys let recovery find reintroduced shared pixels without
+ * retaining their PNG strings in Markdown caches. Exact strings still dedupe.
+ */
+const payloadsByKey = new Map<string, Payload>();
+function payloadKey(base64: string): string {
+	return createHash("sha256").update(base64).digest("hex");
+}
+/** Fixed 2 MiB ledger for all transmitted 24-bit IDs, including evicted entries.
+ * Eviction must neither grow a Set forever nor delete images in scrollback.
+ */
+const transmitted = new Uint32Array(1 << 19);
+/** Resident images whose data the terminal has. */
 const sent = new Set<number>();
-/** Images whose virtual placement exists (placeholder mode). */
+/** Resident images whose virtual placement exists (placeholder mode). */
 const placed = new Set<number>();
 let hooked = false;
 
-/** Make an image known. Without a frame hook it is sent immediately. */
-export function registerImage(id: number, base64: string, columns: number, rows: number): void {
-	if (!registry.has(id)) {
-		const size = getPngDimensions(base64);
-		const cell = getCellDimensions();
-		registry.set(id, {
-			base64,
-			columns,
-			rows,
-			widthPx: size?.widthPx ?? columns * cell.widthPx,
-			heightPx: size?.heightPx ?? rows * cell.heightPx,
-		});
-		registryBytes += base64.length;
-		while (registry.size > REGISTRY_LIMIT || registryBytes > REGISTRY_BYTES) {
-			const oldest = registry.keys().next().value!;
-			registryBytes -= registry.get(oldest)!.base64.length;
-			registry.delete(oldest);
-			// Cached placeholder lines must be rebuilt/re-registered when revisited.
-			bumpVersion();
-		}
+/** Replay recipes contain renderer arguments, never retained PNG strings. Their
+ * lifetime follows the Markdown text caches; only the outgoing frame uses them.
+ */
+interface ImageRecovery {
+	render: () => unknown;
+	ordinal: number;
+	bytes: number;
+	columns: number;
+	rows: number;
+	payloadKey: string;
+}
+export type ImageRecoveries = Map<number, ImageRecovery>;
+let captureRegistration: ((id: number, recovery: Omit<ImageRecovery, "render" | "ordinal">) => void) | undefined;
+let replayRegistration: ((base64: string, columns: number, rows: number) => void) | undefined;
+const frameRecoveries = new Set<ImageRecoveries>();
+const framePins = new Set<number>();
+let recoveryBatchWritten = false;
+
+/** Capture one renderer call, so recovery never rerenders an entire transcript. */
+export function captureImageRecovery<T>(images: ImageRecoveries, render: () => T): T {
+	const previous = captureRegistration;
+	let ordinal = 0;
+	captureRegistration = (id, recovery) => images.set(id, { ...recovery, render, ordinal: ordinal++ });
+	try { return render(); }
+	finally { captureRegistration = previous; }
+}
+
+/** Called on both block- and component-cache hits. Publishing recipes does not
+ * register images: pi may render all history but write only its visible tail.
+ */
+export function useImageRecoveries(images: ImageRecoveries): void {
+	if (recoveryBatchWritten) {
+		frameRecoveries.clear();
+		framePins.clear();
+		recoveryBatchWritten = false;
 	}
-	if (!hooked && !sent.has(id)) {
-		sent.add(id);
-		if (imageMode() === "direct") {
-			directWriter?.(transmitOnlySequence(base64, id));
-		} else {
-			placed.add(id);
-			directWriter?.(transmitSequence(base64, id, columns, rows));
+	if (images.size) frameRecoveries.add(images);
+}
+
+function recoverImage(id: number): ImageData | undefined {
+	const resident = registry.get(id);
+	if (resident) return resident;
+	let recipe: ImageRecovery | undefined;
+	for (const images of frameRecoveries) {
+		recipe = images.get(id);
+		if (recipe) break;
+	}
+	if (!recipe) return;
+	const payload = payloadsByKey.get(recipe.payloadKey);
+	// Avoid even invoking the renderer when this visible working set cannot
+	// admit the image. In particular, don't churn raster/source caches on each
+	// redraw of an over-capacity frame.
+	if (!evictionCandidates(recipe.bytes, payload, framePins)) return;
+	const previous = replayRegistration;
+	let ordinal = 0;
+	replayRegistration = (base64, columns, rows) => {
+		if (ordinal++ !== recipe.ordinal || columns !== recipe.columns || rows !== recipe.rows) return;
+		// A raster/placement cache may have allocated a new ID. Cached text and
+		// copy identity still refer to the original ID; restore that ID only.
+		admit(id, base64, columns, rows, framePins);
+	};
+	try { recipe.render(); }
+	catch { /* A no-longer-recoverable source keeps the width-preserving fallback. */ }
+	finally { replayRegistration = previous; }
+	const image = registry.get(id);
+	if (image) framePins.add(id);
+	return image;
+}
+
+function noteTransmission(id: number): void {
+	transmitted[id >>> 5]! |= 1 << (id & 31);
+}
+
+function evict(id: number): void {
+	const image = registry.get(id)!;
+	registry.delete(id);
+	framePins.delete(id);
+	sent.delete(id);
+	placed.delete(id);
+	if (--image.payload.references === 0) {
+		payloads.delete(image.payload.base64);
+		payloadsByKey.delete(image.payload.key);
+		registryBytes -= image.payload.base64.length;
+	}
+}
+
+/** Admit atomically: never evict current-batch registrations to make room. */
+function admit(id: number, base64: string, columns: number, rows: number, pins?: ReadonlySet<number>): ImageData | undefined {
+	const hit = registry.get(id);
+	if (hit) {
+		hit.epoch = registrationEpoch;
+		registry.delete(id);
+		registry.set(id, hit);
+		return hit;
+	}
+	const shared = payloads.get(base64);
+	const victims = evictionCandidates(base64.length, shared, pins);
+	if (!victims) return undefined;
+	for (const victim of victims) evict(victim);
+	let payload = payloads.get(base64);
+	if (!payload) {
+		payload = { key: payloadKey(base64), base64, references: 0 };
+		payloads.set(base64, payload);
+		payloadsByKey.set(payload.key, payload);
+		registryBytes += base64.length;
+	}
+	payload.references++;
+	const size = getPngDimensions(base64);
+	const cell = getCellDimensions();
+	const image = {
+		payload, columns, rows, epoch: registrationEpoch,
+		widthPx: size?.widthPx ?? columns * cell.widthPx,
+		heightPx: size?.heightPx ?? rows * cell.heightPx,
+	};
+	registry.set(id, image);
+	return image;
+}
+
+function evictionCandidates(length: number, shared?: Payload, pins?: ReadonlySet<number>): number[] | undefined {
+	if (length > REGISTRY_BYTES) return undefined;
+	let bytes = registryBytes + (shared ? 0 : length);
+	const victims: number[] = [];
+	const removed = new Map<Payload, number>();
+	for (const [oldId, image] of registry) {
+		if (registry.size - victims.length < REGISTRY_LIMIT && bytes <= REGISTRY_BYTES) break;
+		if (pins ? pins.has(oldId) : image.epoch === registrationEpoch) continue;
+		victims.push(oldId);
+		const count = (removed.get(image.payload) ?? 0) + 1;
+		removed.set(image.payload, count);
+		if (count === image.payload.references && image.payload !== shared) bytes -= image.payload.base64.length;
+	}
+	if (registry.size - victims.length >= REGISTRY_LIMIT || bytes > REGISTRY_BYTES) return undefined;
+	return victims;
+}
+
+/**
+ * Make an image known. Registrations are pinned until the next frame write.
+ * If that batch exceeds either bound, its excess IDs get a text fallback at
+ * the writer, keeping cached placeholder/copy identities intact. No global
+ * invalidation is needed; re-registration can recover evicted data later.
+ * Without a hook, transmit immediately even when the payload cannot be kept.
+ */
+export function registerImage(id: number, base64: string, columns: number, rows: number): void {
+	if (replayRegistration) {
+		replayRegistration(base64, columns, rows);
+		return;
+	}
+	const image = admit(id, base64, columns, rows);
+	const payload = image?.payload ?? payloads.get(base64);
+	captureRegistration?.(id, { bytes: base64.length, columns, rows, payloadKey: payload?.key ?? payloadKey(base64) });
+	if (!hooked) {
+		if (!sent.has(id)) {
+			noteTransmission(id);
+			if (image) sent.add(id);
+			if (imageMode() === "direct") {
+				directWriter?.(transmitOnlySequence(base64, id));
+			} else {
+				if (image) placed.add(id);
+				directWriter?.(transmitSequence(base64, id, columns, rows));
+			}
 		}
+		registrationEpoch++;
 	}
 }
 
@@ -261,9 +419,11 @@ const ID_IN_FRAME = /\x1b\[38;2;(\d{1,3});(\d{1,3});(\d{1,3})m(?:\x1b\[(?!38;)[\
 /**
  * Placeholder mode: transmissions and placements a frame chunk needs, and
  * where to insert them (after the last clear or delete in the chunk, else at
- * the start). Exported for tests.
+ * the start). Exported for tests; the installed hook uses the streaming
+ * rewriter below so cache misses can also replace cells with text.
  */
 export function prepareFrame(chunk: string, carry = ""): { insertAt: number; transmissions: string } {
+	pinFrame(carry + chunk);
 	let insertAt = 0;
 	RESET.lastIndex = 0;
 	for (let m = RESET.exec(chunk); m; m = RESET.exec(chunk)) {
@@ -271,21 +431,35 @@ export function prepareFrame(chunk: string, carry = ""): { insertAt: number; tra
 	}
 
 	let transmissions = "";
-	if (registry.size === 0) return { insertAt, transmissions };
+	registrationEpoch++;
 	const text = carry + chunk;
 	ID_IN_FRAME.lastIndex = 0;
 	for (let m = ID_IN_FRAME.exec(text); m; m = ID_IN_FRAME.exec(text)) {
 		const id = (Number(m[1]) << 16) | (Number(m[2]) << 8) | Number(m[3]);
 		if (placed.has(id)) continue;
-		const image = registry.get(id);
+		const image = recoverImage(id);
 		if (!image) continue;
 		transmissions += sent.has(id)
 			? virtualPlacementSequence(id, image.columns, image.rows)
-			: transmitSequence(image.base64, id, image.columns, image.rows);
+			: transmitSequence(image.payload.base64, id, image.columns, image.rows);
+		noteTransmission(id);
 		sent.add(id);
 		placed.add(id);
 	}
 	return { insertAt, transmissions };
+}
+
+/** Pin all resident IDs before recovering any missing ones, including IDs later
+ * in the write. Keep pins across split writes until the next Markdown render.
+ */
+function pinFrame(text: string, foreground?: number): void {
+	recoveryBatchWritten = true;
+	if (foreground !== undefined && registry.has(foreground)) framePins.add(foreground);
+	ID_IN_FRAME.lastIndex = 0;
+	for (let m = ID_IN_FRAME.exec(text); m; m = ID_IN_FRAME.exec(text)) {
+		const id = (Number(m[1]) << 16) | (Number(m[2]) << 8) | Number(m[3]);
+		if (registry.has(id)) framePins.add(id);
+	}
 }
 
 /** Longest output held back while waiting for the end of a split escape sequence. */
@@ -297,9 +471,10 @@ let lastDirectPlacement = PLACEMENT;
  * Direct mode gives every slice it places a placement id of its own. WezTerm
  * removes all placements of an image when it is placed again without one, so
  * the rows of a display formula, or two occurrences of the same `$x$`, would
- * erase each other until only the last slice placed was left. A redraw still
- * replaces what was on screen: the cells are erased (ECH) before the slice is
- * placed, and erasing detaches the old slice.
+ * erase each other until only the last slice placed was left. ECH clears the
+ * underlying text before each slice. Some terminals do not detach old image
+ * placements when erasing text; direct-redraw.ts handles that in fullscreen
+ * mode by letting Pi clear and redraw the complete viewport.
  */
 function nextDirectPlacement(): number {
 	lastDirectPlacement = lastDirectPlacement >= 0xffffff ? PLACEMENT + 1 : lastDirectPlacement + 1;
@@ -313,12 +488,18 @@ function nextDirectPlacement(): number {
  * held back until they are complete. Exported for tests.
  */
 export function createDirectRewriter(): (chunk: string) => string {
+	return createFrameRewriter("direct");
+}
+
+/** Same streaming parser in both modes, including cache-miss text fallback. */
+function createFrameRewriter(mode: "direct" | "placeholder"): (chunk: string) => string {
 	let pending = "";
 	/** Image id of the current truecolor foreground, if any. */
 	let fg: number | undefined;
 
 	return (chunk) => {
 		const text = pending + chunk;
+		pinFrame(text, fg);
 		pending = "";
 		let out = "";
 		let i = 0;
@@ -327,15 +508,30 @@ export function createDirectRewriter(): (chunk: string) => string {
 		let runRow = -1;
 		let runStart = 0;
 		let runLength = 0;
+		let runText = "";
 
 		const flushRun = () => {
 			if (runLength === 0) return;
-			const image = registry.get(runId);
+			const image = recoverImage(runId);
 			if (!image) {
-				out += " ".repeat(runLength);
+				// Address by cell coordinates so split writes and partial redraws agree.
+				// Use the default foreground, not the arbitrary RGB encoding the ID.
+				const label = runRow === 0 ? "? image unavailable" : "";
+				out += PLACEHOLDER_CLOSE + label.slice(runStart, runStart + runLength).padEnd(runLength) + placeholderOpen(runId);
+			} else if (mode === "placeholder") {
+				if (!placed.has(runId)) {
+					out += sent.has(runId)
+						? virtualPlacementSequence(runId, image.columns, image.rows)
+						: transmitSequence(image.payload.base64, runId, image.columns, image.rows);
+					noteTransmission(runId);
+					sent.add(runId);
+					placed.add(runId);
+				}
+				out += runText;
 			} else {
 				if (!sent.has(runId)) {
-					out += transmitOnlySequence(image.base64, runId);
+					out += transmitOnlySequence(image.payload.base64, runId);
+					noteTransmission(runId);
 					sent.add(runId);
 				}
 				const sw = image.widthPx / image.columns;
@@ -352,6 +548,7 @@ export function createDirectRewriter(): (chunk: string) => string {
 					`\x1b[${runLength}C`;
 			}
 			runLength = 0;
+			runText = "";
 		};
 
 		while (i < text.length) {
@@ -404,6 +601,7 @@ export function createDirectRewriter(): (chunk: string) => string {
 					runStart = column;
 					runLength = 1;
 				}
+				if (fg !== undefined) runText += text.slice(i, j);
 				i = j;
 				continue;
 			}
@@ -428,6 +626,7 @@ export function createDirectRewriter(): (chunk: string) => string {
 			out += pending;
 			pending = "";
 		}
+		if (!pending) registrationEpoch++;
 		return out;
 	};
 }
@@ -489,20 +688,12 @@ interface WritableTerminal {
 /** Wrap pi's terminal writer so images travel with the frames that show them. Returns an uninstaller. */
 export function installFrameHook(terminal: WritableTerminal, mode: ImageMode = imageMode()): () => void {
 	const original = terminal.write;
-	let carry = "";
-	const rewrite = mode === "direct" ? createDirectRewriter() : undefined;
+	const rewrite = createFrameRewriter(mode === "direct" ? "direct" : "placeholder");
 	const hook = function (this: unknown, data: string) {
 		let out = data;
 		if (typeof data === "string" && data.length > 0) {
 			try {
-				if (rewrite) {
-					out = rewrite(data);
-				} else {
-					const { insertAt, transmissions } = prepareFrame(data, carry);
-					if (transmissions) out = data.slice(0, insertAt) + transmissions + data.slice(insertAt);
-					// A placeholder's color sequence may straddle two writes.
-					carry = data.slice(-40);
-				}
+				out = rewrite(data);
 			} catch {
 				out = data;
 			}
@@ -527,13 +718,26 @@ export function forgetImages(): void {
 	sent.clear();
 	placed.clear();
 	registry.clear();
+	payloads.clear();
+	payloadsByKey.clear();
+	transmitted.fill(0);
 	registryBytes = 0;
+	registrationEpoch = 0;
+	frameRecoveries.clear();
+	framePins.clear();
+	recoveryBatchWritten = false;
 }
 
 /** Free every image this process sent (terminal side) and forget them (explicit cache clear). */
 export function deleteImages(write: Writer | undefined = directWriter): void {
 	let out = "";
-	for (const id of sent) out += deleteSequence(id);
+	for (let word = 0; word < transmitted.length; word++) {
+		const bits = transmitted[word]!;
+		if (!bits) continue;
+		for (let bit = 0; bit < 32; bit++) {
+			if (bits & (1 << bit)) out += deleteSequence(word * 32 + bit);
+		}
+	}
 	forgetImages();
 	if (out) write?.(out);
 }

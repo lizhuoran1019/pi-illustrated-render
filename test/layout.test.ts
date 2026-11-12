@@ -8,9 +8,9 @@ import { loadMathJax } from "../src/math/mathjax.ts";
 import { renderBlock } from "../src/render/blocks.ts";
 import { codeButtonText } from "../src/render/code-action.ts";
 import { noMath, type CodeAction, type IllustrationRenderer, type MathRenderer } from "../src/render/context.ts";
-import { clearLexCache, lex } from "../src/render/lexer.ts";
+import { clearLexCache, lex, lexStats } from "../src/render/lexer.ts";
 import { clearBlockCache, renderMarkdown, RichMarkdown } from "../src/render/rich-markdown.ts";
-import { wrap } from "../src/render/util.ts";
+import { decodeEntities, wrap } from "../src/render/util.ts";
 import { state } from "../src/state.ts";
 import { plainStyle } from "../src/style.ts";
 
@@ -23,7 +23,7 @@ const draw = (source: string, width: number, math: MathRenderer = noMath, stream
 let saved: { math: typeof state.math; lineNumbers: boolean; images?: string; fonts?: string };
 beforeEach(() => {
 	saved = { math: state.math, lineNumbers: state.lineNumbers, images: process.env.PI_BETTER_RENDER_IMAGES, fonts: process.env.PI_BETTER_RENDER_FONT_DOWNLOAD };
-	state.math = "streaming"; state.lineNumbers = false;
+	state.math = "streaming"; state.lineNumbers = false; state.imagesAllowed = true;
 	process.env.PI_BETTER_RENDER_IMAGES = "placeholder";
 	process.env.PI_BETTER_RENDER_FONT_DOWNLOAD = "0";
 	setCellDimensions({ widthPx: 9, heightPx: 20 });
@@ -99,6 +99,63 @@ test("copy controls retain exact original code and nested/padded coordinates", a
 test("code spans preserve literal entities while normal prose decodes them", () => {
 	assert.deepEqual(plain(draw("`&lt;div&gt; &#65; &amp;`", 80)), ["&lt;div&gt; &#65; &amp;"]);
 	assert.deepEqual(plain(draw("&lt;div&gt; &#65; &amp;", 80)), ["<div> A &"]);
+});
+
+test("numeric entities decode text and whitespace but never terminal controls or invalid scalars", () => {
+	for (const code of [...Array.from({ length: 32 }, (_, i) => i), ...Array.from({ length: 33 }, (_, i) => 127 + i), 0xd800, 0xdfff, 0x110000]) {
+		if ([9, 10, 13].includes(code)) continue;
+		for (const entity of [`&#${code};`, `&#x${code.toString(16)};`]) {
+			assert.equal(decodeEntities(entity), entity);
+			assert.equal(plain(draw(`before ${entity}[2J after`, 80)).join(""), `before ${entity}[2J after`);
+		}
+	}
+	assert.equal(decodeEntities("&#9;&#10;&#13; &#65; &#x4e2d; &#x1f600; &amp; &unknown;"), "\t\n\r A 中 😀 & &unknown;");
+	const attack = "&#27;]52;c;Y2xpcGJvYXJk&#7; and &#x9b;2J";
+	assert.ok(!draw(attack, 90).join("").includes("\x1b"));
+	assert.equal(plain(draw(`\`${attack}\``, 90)).join(""), attack);
+});
+
+test("streamed definitions in quotes/lists resolve old links and retain the parser links map", () => {
+	const base = "[link][r] ![field][f]\n\none\n\ntwo\n\nthree";
+	for (const definitions of [
+		"\n\n> [r]: https://example.com\n> [f]: a.svg\n",
+		"\n\n- [r]: https://example.com\n  [f]: a.svg\n",
+		"\n\n> - [r]: https://example.com\n>   [f]: a.svg\n",
+	]) {
+		clearLexCache(); clearBlockCache();
+		draw(base, 90, noMath, true);
+		let source = base;
+		for (const character of definitions) { source += character; draw(source, 90, noMath, true); }
+		const incremental = draw(source, 90, noMath, true);
+		const final = draw(source, 90);
+		const links = (lex(source, false) as any).links;
+		assert.equal(links.r.href, "https://example.com");
+		assert.equal(links.f.href, "a.svg");
+		clearLexCache(); clearBlockCache();
+		assert.deepEqual(incremental, draw(source, 90, noMath, true));
+		assert.deepEqual(final, draw(source, 90));
+		assert.match(plain(final).join("\n"), /link ‹https:\/\/example.com› \[image: field\]/);
+		assert.ok(!plain(final).join("\n").includes("[link][r]"));
+	}
+	clearLexCache();
+	lex("a\n\nb\n\nc\n\nd", true);
+	const count = lexStats.incremental;
+	const extended = lex("a\n\nb\n\nc\n\ndef", true);
+	assert.equal(lexStats.incremental, count + 1, "ordinary append-only text keeps incremental lexing");
+	assert.deepEqual(Object.keys((extended as any).links), []);
+});
+
+test("header-only tables retain their headings at narrow and wide widths, also when nested", () => {
+	const source = "| 甲乙 | Header |\n| --- | --- |";
+	for (const width of [2, 3, 6, 12, 30]) {
+		for (const prefix of ["", "> "]) {
+			const markdown = source.split("\n").map((line) => prefix + line).join("\n");
+			const lines = draw(markdown, width);
+			bounded(lines, width);
+			const text = plain(lines).join("").replace(/[\s▎│╭╮╰╯┬┴├┤┼─]/gu, "");
+			assert.equal(text, "甲乙Header");
+		}
+	}
 });
 
 test("callout marker removal preserves resolved references and shared lexer tokens", () => {
@@ -214,6 +271,62 @@ test("real inline math respects width, streaming/final/off modes and original co
 	assert.ok(draw(`prefix ${source}`, 30, math, false).join("").includes(PLACEHOLDER));
 	state.math = "off";
 	assert.ok(!draw(`prefix ${source}`, 30, math).join("").includes(PLACEHOLDER));
+});
+
+test("CJK soft breaks keep punctuation with adjacent text without altering hard breaks or code", () => {
+	const sources = ["甲乙丙丁。戊己", "甲乙丙（丁戊）己", "甲乙丙丁，戊己。", "甲乙丙丁。』戊己", "甲乙丙【丁戊】己", "甲乙👩‍💻丙丁，戊己。"];
+	for (const width of [6, 8, 10, 12]) {
+		for (const source of sources) {
+			const lines = wrap(source, width);
+			bounded(lines, width);
+			assert.equal(plain(lines).join(""), source);
+			assert.ok(plain(lines).slice(1).every((line) => !/^[，。、；：！？）》〉」』】〕］｝”’]/u.test(line)), JSON.stringify(lines));
+			assert.ok(plain(lines).slice(0, -1).every((line) => !/[（《〈「『【〔［｛“‘]$/u.test(line)), JSON.stringify(lines));
+		}
+	}
+	for (const newline of ["\n", "\r\n", "\r"]) assert.deepEqual(wrap(`甲乙${newline}。丙丁`, 10), ["甲乙", "。丙丁"]);
+	assert.equal(plain(draw("甲乙  \n。丙丁", 10)).join("\n"), "甲乙\n。丙丁");
+	const code = "甲乙丙丁。戊己";
+	const lines = draw(`\`\`\`text\n${code}\n\`\`\``, 10);
+	assert.equal(plain(lines.slice(1, -1)).map((line) => line.replace(/^[ ↪]/, "").trimEnd()).join(""), code);
+	for (const width of [1, 2, 3, 4]) bounded(wrap("甲（乙）。丙", width), width);
+});
+
+test("CJK repairs underfilled lines created by moving an opening bracket", () => {
+	for (const [source, width, expected] of [
+		["甲（乙丙）丁", 4, ["甲", "（乙", "丙）", "丁"]],
+		["甲甲甲（乙乙乙乙）丁", 8, ["甲甲甲", "（乙乙乙", "乙）丁"]],
+	] as const) {
+		assert.deepEqual(wrap(source, width), expected);
+		assert.deepEqual(plain(draw(source, width)), expected);
+		bounded(wrap(source, width), width);
+		assert.equal(plain(wrap(source, width)).join(""), source);
+	}
+});
+
+test("CJK break repairs preserve styling, links and whole formula image cells", () => {
+	const open = "\x1b]8;;https://example.com\x1b\\", close = "\x1b]8;;\x1b\\";
+	for (const [text, width] of [["甲乙丙丁。戊己", 8], ["甲（乙丙）丁", 4], ["甲甲甲（乙乙乙乙）丁", 8]] as const) {
+		const source = `\x1b[1m${open}${text}${close}\x1b[22m`;
+		const lines = wrap(source, width);
+		assert.equal(plain(lines).join(""), text);
+		for (const line of lines) {
+			assert.match(sliceByColumn(line, 0, 2), /\x1b\[1m/);
+			assert.equal(getOsc8LinkAtColumn(line, 0), "https://example.com");
+			assert.equal(getOsc8LinkAtColumn(line + " padding", visibleWidth(line) + 1), undefined);
+		}
+	}
+	const image = placeholderRows(101, 6, 1)[0]!;
+	rememberFormulaSource(101, "$x+y$", false);
+	for (const text of [`甲${image}。乙`, `${image}甲。乙`, `甲乙。${image}。丙`]) {
+		for (const width of [6, 8, 10, 12]) {
+			const output = wrap(text, width);
+			bounded(output, width);
+			assert.equal(output.join("").split(image).length - 1, 1);
+			assert.equal(plain(output).join(""), stripTerminalSequences(text));
+			assert.ok(selectionWithFormulas(output).includes("$x+y$"));
+		}
+	}
 });
 
 test("figure captions and decoded original links share the centered image bounds, including nested quotes", () => {

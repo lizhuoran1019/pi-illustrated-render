@@ -110,6 +110,13 @@ function renderCards(header: string[], rows: string[][], ctx: RenderContext): st
 	const lines: string[] = [];
 	const indent = Math.min(2, Math.max(0, ctx.width - 2));
 	const bar = indent === 2 ? style.fg("mdQuoteBorder", "▎") + " " : indent === 1 ? style.fg("mdQuoteBorder", "▎") : "";
+	if (rows.length === 0) {
+		for (const name of header) {
+			const label = style.bold(style.fg("mdHeading", name));
+			for (const line of wrap(label, ctx.width - indent)) lines.push(bar + line);
+		}
+		return lines;
+	}
 	rows.forEach((row, r) => {
 		if (r > 0) lines.push("");
 		header.forEach((name, i) => {

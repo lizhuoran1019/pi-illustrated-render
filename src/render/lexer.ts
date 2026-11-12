@@ -114,7 +114,6 @@ interface LexEntry {
 
 const RECENT_LIMIT = 8;
 const recent: LexEntry[] = [];
-const REF_DEF = /^ {0,3}\[[^\]\n]+\]:/m;
 const REUSE_BLOCKS_KEPT = 2;
 
 export const lexStats = { full: 0, incremental: 0 };
@@ -141,10 +140,15 @@ function lexFrom(previous: LexEntry, src: string, streaming: boolean): Token[] |
 		if (tokens[cut]!.type !== "space") seen++;
 	}
 	if (cut === 0) return undefined;
-	const offset = offsets[cut]!;
-	// A definition anywhere can change how earlier links lex.
-	if (REF_DEF.test(src)) return undefined;
-	return tokens.slice(0, cut).concat(fullLex(src.slice(offset), streaming));
+	// Marked collects definitions globally, including those nested in quotes
+	// and lists. Either the old document or the new tail may resolve links in
+	// the reused prefix, so consult the parser's map rather than source regexes.
+	const linksOf = (items: Token[]) => (items as Token[] & { links?: Record<string, unknown> }).links ?? {};
+	if (Object.keys(linksOf(tokens)).length > 0) return undefined;
+	const tail = fullLex(src.slice(offsets[cut]!), streaming);
+	const links = linksOf(tail);
+	if (Object.keys(links).length > 0) return undefined;
+	return Object.assign(tokens.slice(0, cut).concat(tail), { links });
 }
 
 export function lex(markdown: string, streaming: boolean): Token[] {

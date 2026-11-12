@@ -8,6 +8,7 @@
  */
 import { sliceByColumn, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { state } from "../state.ts";
+import { captureImageRecovery, useImageRecoveries, type ImageRecoveries } from "../math/kitty.ts";
 import type { Style } from "../style.ts";
 import { renderBlock } from "./blocks.ts";
 import { codeButtonText, type CopyStatus } from "./code-action.ts";
@@ -17,7 +18,7 @@ import { lex } from "./lexer.ts";
 export type MarkdownTransform = (markdown: string, availableWidth: number) => string;
 
 const BLOCK_CACHE_LIMIT = 4000;
-type RenderedBlock = { lines: string[]; actions: CodeAction[] };
+type RenderedBlock = { lines: string[]; actions: CodeAction[]; images: ImageRecoveries };
 const blockCache = new Map<string, RenderedBlock>();
 let byToken = new WeakMap<object, { context: string; block: RenderedBlock }>();
 
@@ -66,7 +67,7 @@ export interface RichMarkdownOptions extends Omit<RenderOptions, "style"> {
 }
 
 /** Render markdown to terminal lines of at most `width` columns (no padding). */
-export function renderMarkdown(markdown: string, width: number, options: RenderOptions, actions?: CodeAction[]): string[] {
+export function renderMarkdown(markdown: string, width: number, options: RenderOptions, actions?: CodeAction[], imageCaches?: Set<ImageRecoveries>): string[] {
 	const { style, math, illustrations, streaming } = options;
 	const tokens = lex(markdown, streaming);
 	const ctx: RenderContext = { style, math, illustrations, width, streaming, listDepth: 0 };
@@ -91,11 +92,27 @@ export function renderMarkdown(markdown: string, width: number, options: RenderO
 		} else {
 			block = cached(`${context}\0${token.type}\0${token.raw}`, () => {
 				const buttons: CodeAction[] = [];
-				const rendered = renderBlock(token, { ...ctx, streaming: phase !== "f", onCode: actions ? (action) => buttons.push(action) : undefined });
-				return { lines: rendered, actions: buttons };
+				const images: ImageRecoveries = new Map();
+				// Recipes call the original renderer with the original layout args.
+				// They retain no raster data and work even after its placement ID expires.
+				const rendered = renderBlock(token, {
+					...ctx, streaming: phase !== "f", onCode: actions ? (action) => buttons.push(action) : undefined,
+					math: {
+						key: math.key,
+						inline: (...args) => captureImageRecovery(images, () => math.inline(...args)),
+						block: (...args) => captureImageRecovery(images, () => math.block(...args)),
+					},
+					illustrations: illustrations ? {
+						key: illustrations.key,
+						block: (...args) => captureImageRecovery(images, () => illustrations.block(...args)),
+					} : undefined,
+				});
+				return { lines: rendered, actions: buttons, images };
 			});
 			byToken.set(token, { context, block });
 		}
+		useImageRecoveries(block.images);
+		imageCaches?.add(block.images);
 		if (block.lines.length === 0) return;
 		if (lines.length > 0) lines.push("");
 		for (const action of block.actions) actions?.push({ ...action, y: action.y + lines.length });
@@ -108,6 +125,7 @@ export class RichMarkdown implements Component {
 	private cacheWidth = -1;
 	private cacheVersion = "";
 	private cacheLines: string[] = [];
+	private imageCaches = new Set<ImageRecoveries>();
 	private actions: CodeAction[] = [];
 	private pressed?: CodeAction;
 	private copying = false;
@@ -126,7 +144,10 @@ export class RichMarkdown implements Component {
 	render(width: number): string[] {
 		const style = this.style();
 		const version = `${style.key}\0${this.options.math.key}\0${this.options.illustrations?.key ?? ""}\0${state.version}`;
-		if (width === this.cacheWidth && version === this.cacheVersion) return this.withFeedback();
+		if (width === this.cacheWidth && version === this.cacheVersion) {
+			for (const images of this.imageCaches) useImageRecoveries(images);
+			return this.withFeedback();
+		}
 
 		const padding = Math.min(Math.max(0, Math.floor(this.options.paddingX)), Math.max(0, Math.floor((width - 1) / 2)));
 		const contentWidth = Math.max(1, width - padding * 2);
@@ -138,8 +159,9 @@ export class RichMarkdown implements Component {
 		}
 		const prefix = " ".repeat(padding);
 		const actions: CodeAction[] = [];
+		this.imageCaches.clear();
 		const lines = markdown.trim()
-			? renderMarkdown(markdown, contentWidth, { style, math: this.options.math, illustrations: this.options.illustrations, streaming: this.options.streaming }, this.options.copyCode ? actions : undefined)
+			? renderMarkdown(markdown, contentWidth, { style, math: this.options.math, illustrations: this.options.illustrations, streaming: this.options.streaming }, this.options.copyCode ? actions : undefined, this.imageCaches)
 				.map((line) => (line ? prefix + line : line))
 			: [];
 		this.actions = actions.map((action) => ({ ...action, x: action.x + padding }));

@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 import { AssistantMessageComponent, initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
+import { getCapabilities, setCapabilities, setCellDimensions, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { fileURLToPath } from "node:url";
+import { PLACEHOLDER } from "../src/math/kitty.ts";
+import { loadMathJax } from "../src/math/mathjax.ts";
 import extension, { hasCompetingRenderer } from "../src/index.ts";
+import { installDirectRedraw } from "../src/direct-redraw.ts";
 import { applyPatch, isPatched, removePatch } from "../src/patch.ts";
 import { RichMarkdown } from "../src/render/rich-markdown.ts";
 import { noMath } from "../src/render/context.ts";
@@ -14,7 +18,7 @@ type Message = NonNullable<ConstructorParameters<typeof AssistantMessageComponen
 const message = (text: string): Message => ({ role: "assistant", content: [{ type: "text", text }], api: "openai-completions", provider: "test", model: "fixture", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 });
 const render = (c: AssistantMessageComponent) => c.render(90).map(stripTerminalSequences).join("\n");
 
-beforeEach(() => { initTheme("dark"); state.enabled = true; state.imageBackground = "none"; state.imageMaxRows = 28; });
+beforeEach(() => { initTheme("dark"); state.enabled = state.imagesAllowed = state.illustrations = true; state.math = "streaming"; state.imageBackground = "none"; state.imageMaxRows = 28; });
 afterEach(() => { removePatch(); AssistantMessageComponent.prototype.updateContent = original; });
 
 test("actual assistant slots survive repeated streaming updates; transforms and stored content stay intact", () => {
@@ -120,6 +124,112 @@ test("image controls validate height, update cache identity and expose current l
 		assert.deepEqual(await definition!.getArgumentCompletions!("images:height:56"), []);
 	} finally { hooks.get("session_shutdown")!(); }
 	assert.equal(isPatched(), false);
+});
+
+/** Actual extension lifecycle and terminal hook, with output kept in memory. */
+async function terminalHarness(showImages: boolean) {
+	const hooks = new Map<string, (...args: any[]) => any>();
+	let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
+	const settings = { terminal: { showImages } };
+	const notices: string[] = [], writes: string[] = [];
+	const tui = { mode: "fullscreen", terminal: { write(data: string) { writes.push(data); } }, invalidate() {}, requestRender() {}, doRender() {}, resetRenderState() {}, getActiveSelectionText() { return undefined; } };
+	const ctx = { mode: "tui", cwd: fileURLToPath(new URL("../", import.meta.url)), ui: {
+		setWidget(_name: string, factory?: (tui: unknown) => unknown) { factory?.(tui); },
+		notify(text: string) { notices.push(text); },
+	} };
+	extension({
+		on: (name: string, fn: (...args: any[]) => any) => { hooks.set(name, fn); },
+		registerCommand(_name: string, definition: NonNullable<typeof command>) { command = definition; },
+		getCommands: () => [], getSettings: () => settings,
+	} as unknown as ExtensionAPI);
+	await hooks.get("session_start")!({}, ctx);
+	return {
+		settings, notices,
+		run: (arg: string) => command!.handler(arg, ctx as any),
+		frame: (component: AssistantMessageComponent) => { writes.length = 0; tui.terminal.write(component.render(90).join("\n")); return writes.join(""); },
+		prompt: () => { const event = { systemPromptOptions: { sections: {} as Record<string, string> } }; hooks.get("before_agent_start")!(event); return event.systemPromptOptions.sections; },
+		stop: () => hooks.get("session_shutdown")!(),
+	};
+}
+
+test("entity controls cannot reach the actual assistant terminal writer; normal links survive", async () => {
+	const h = await terminalHarness(false);
+	try {
+		const stored = message("**text** &#27;[2J &#x9b;2J &#27;]52;c;YQ==&#7; [guide](https://example.com)");
+		const snapshot = JSON.stringify(stored);
+		const output = h.frame(new AssistantMessageComponent(stored));
+		// Native OSC 133 shell-integration markers legitimately contain BEL.
+		assert.ok(!output.includes("\x1b[2J") && !output.includes("\x9b") && !output.includes("\x1b]52;"), JSON.stringify(output));
+		assert.ok(output.includes("&#27;") && output.includes("&#x9b;") && output.includes("YQ==&#7;"));
+		assert.ok(output.includes("\x1b]8;;https://example.com"));
+		assert.equal(JSON.stringify(stored), snapshot);
+	} finally { h.stop(); }
+});
+
+test("terminal image permission covers math and illustrations, including cached components and forced protocols", async () => {
+	const caps = getCapabilities(), previous = process.env.PI_BETTER_RENDER_IMAGES;
+	setCapabilities({ ...caps, images: "kitty" });
+	setCellDimensions({ widthPx: 8, heightPx: 16 });
+	assert.ok(await loadMathJax());
+	try {
+		for (const mode of [undefined, "placeholder", "direct"]) {
+			if (mode === undefined) delete process.env.PI_BETTER_RENDER_IMAGES; else process.env.PI_BETTER_RENDER_IMAGES = mode;
+			const h = await terminalHarness(false);
+			try {
+				const stored = message("$x+y$\n\n$$x^2$$\n\n![diagram](examples/electric-field.png)");
+				const snapshot = JSON.stringify(stored);
+				const component = new AssistantMessageComponent(stored);
+				const disabled = () => {
+					const output = h.frame(component);
+					assert.ok(!output.includes(PLACEHOLDER) && !output.includes("\x1b_G"));
+					assert.match(stripTerminalSequences(output), /终端图片已关闭/);
+					assert.ok(!h.prompt().illustrated_render);
+				};
+				disabled();
+				await h.run("images:on"); await h.run("math:streaming"); disabled();
+				await h.run("status"); assert.match(h.notices.at(-1)!, /terminal.showImages/);
+				// No reload or component replacement: render-time permission sync
+				// must invalidate both math and illustration caches in either direction.
+				h.settings.terminal.showImages = true;
+				await h.run("images:off");
+				const allowed = h.frame(component);
+				assert.ok(allowed.includes("\x1b_Ga="), "images:off must not turn off formula images");
+				assert.match(stripTerminalSequences(allowed), /图片显示已关闭/);
+				h.settings.terminal.showImages = false; disabled();
+				h.settings.terminal.showImages = true;
+				await h.run("images:on");
+				assert.ok(h.prompt().illustrated_render);
+				assert.equal(JSON.stringify(stored), snapshot);
+			} finally { h.stop(); }
+		}
+	} finally {
+		setCapabilities(caps);
+		if (previous === undefined) delete process.env.PI_BETTER_RENDER_IMAGES; else process.env.PI_BETTER_RENDER_IMAGES = previous;
+	}
+});
+
+test("direct fullscreen frames reset only on real renders and release their instance hook", () => {
+	const calls: string[] = [];
+	const host = { mode: "fullscreen", uploadedKittyImages: new Map([[123, {}]]), resetRenderState() { calls.push("reset"); }, doRender() { calls.push("render"); } };
+	const originalRender = host.doRender;
+	let stop = installDirectRedraw(host, "placeholder");
+	assert.equal(host.doRender, originalRender); stop();
+	host.mode = "normal"; stop = installDirectRedraw(host, "direct");
+	assert.equal(host.doRender, originalRender); stop();
+	host.mode = "fullscreen"; stop = installDirectRedraw(host, "direct");
+	assert.deepEqual(calls, [], "installing must not schedule any extra render");
+	assert.equal(host.uploadedKittyImages.size, 1, "other modes and installing preserve native image state");
+	host.doRender(); host.doRender();
+	assert.deepEqual(calls, ["reset", "render", "reset", "render"]);
+	assert.equal(host.uploadedKittyImages.size, 0, "full direct frames reupload native PNGs as well");
+	stop(); assert.equal(host.doRender, originalRender);
+	stop = installDirectRedraw(host, "direct");
+	const ours = host.doRender;
+	const later = () => ours.call(host);
+	host.doRender = later;
+	stop(); assert.equal(host.doRender, later);
+	calls.length = 0; host.doRender(); assert.deepEqual(calls, ["render"]);
+	assert.throws(() => installDirectRedraw({ mode: "fullscreen" }, "direct"), /placeholder/);
 });
 
 test("extension never registers context/message mutation hooks and skips RPC rendering", async () => {

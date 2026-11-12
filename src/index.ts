@@ -1,6 +1,7 @@
 /** pi-illustrated-render: display-only assistant Markdown with local illustrations. */
 import { type ExtensionAPI, type ExtensionContext, copyToClipboard, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { IllustrationService } from "./illustrations.ts";
+import { installDirectRedraw } from "./direct-redraw.ts";
 import { forgetFormulaSources, installCopyHook, type SelectionHost } from "./math/copy.ts";
 import { createMathRenderer, clearFormulaCache } from "./math/formula.ts";
 import { deleteImages, forgetImages, imageMode, installFrameHook } from "./math/kitty.ts";
@@ -15,6 +16,7 @@ let ui: ExtensionContext["ui"] | undefined;
 let tui: { mode?: string; requestRender?: () => void; invalidate?: () => void; terminal?: { write(data: string): void } } | undefined;
 let uninstallFrameHook: (() => void) | undefined;
 let uninstallCopyHook: (() => void) | undefined;
+let uninstallDirectRedraw: (() => void) | undefined;
 let illustrations: IllustrationService | undefined;
 let active = false;
 let lifecycle = 0;
@@ -58,7 +60,8 @@ function stop(): void {
 	removePatch();
 	uninstallFrameHook?.();
 	uninstallCopyHook?.();
-	uninstallFrameHook = uninstallCopyHook = undefined;
+	uninstallDirectRedraw?.();
+	uninstallFrameHook = uninstallCopyHook = uninstallDirectRedraw = undefined;
 	illustrations?.dispose();
 	dropCaches(false);
 	illustrations = undefined;
@@ -82,6 +85,7 @@ function captureTui(ctx: ExtensionContext): boolean {
 	if (!tui?.terminal) return false;
 	setRenderRequester(refreshAll);
 	uninstallFrameHook = installFrameHook(tui.terminal);
+	uninstallDirectRedraw = installDirectRedraw(tui);
 	uninstallCopyHook = installCopyHook(tui as SelectionHost);
 	return true;
 }
@@ -94,11 +98,21 @@ export function hasCompetingRenderer(commands: ReturnType<ExtensionAPI["getComma
 	));
 }
 
+/** Settings can change without reloading the extension. Recheck before display. */
+function syncImagePermission(pi: ExtensionAPI): void {
+	const allowed = pi.getSettings().terminal?.showImages !== false;
+	if (allowed !== state.imagesAllowed) {
+		state.imagesAllowed = allowed;
+		bumpVersion();
+	}
+}
+
 function statusText(): string {
 	if (!active) return `pi-illustrated-render 未启用：${inactiveReason}`;
 	return [
-		`图文排版：${state.enabled ? "开启" : "关闭"} · 插图：${state.illustrations ? "开启" : "关闭"} · 公式：${state.math}`,
-		`插图背景：${state.imageBackground} · 预览高度：${state.imageMaxRows} 行 · 图像通道：${imageMode()}`,
+		`图文排版：${state.enabled ? "开启" : "关闭"} · 插图：${state.illustrations && state.imagesAllowed ? "开启" : "关闭"} · 公式：${state.math}`,
+		`终端图片：${state.imagesAllowed ? "允许" : "关闭（terminal.showImages）；公式使用文字"} · 图像通道：${imageMode()}`,
+		`插图背景：${state.imageBackground} · 预览高度：${state.imageMaxRows} 行`,
 		`SVG/PNG：本地文件，上限 8 MiB · 图下链接可查看原图`,
 		`公式引擎：${mathjaxReady() ? "MathJax + resvg" : mathjaxError() ?? "加载中…"}`,
 	].join("\n");
@@ -118,10 +132,11 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 		ui = ctx.ui;
 		try {
 			if (!captureTui(ctx)) throw new Error("无法取得 TUI 图像输出通道");
-			state.illustrations = pi.getSettings().terminal?.showImages !== false;
+			syncImagePermission(pi);
+			state.illustrations = true;
 			illustrations = new IllustrationService(ctx.cwd);
 			if (!applyPatch((text, paddingX, streaming, transform) => new RichMarkdown(text, {
-				style: currentStyle, math, illustrations, streaming, paddingX, transform,
+				style: () => { syncImagePermission(pi); return currentStyle(); }, math, illustrations, streaming, paddingX, transform,
 				copyCode: tui?.mode === "fullscreen" ? copyToClipboard : undefined,
 				onCopyError: (error) => ui?.notify(`复制失败：${String(error)}`, "error"),
 				requestRender: () => tui?.requestRender?.(),
@@ -139,7 +154,9 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", stop);
 	pi.on("before_agent_start", (event) => {
-		if (!active || !state.enabled || !state.illustrations || imageMode() === "off") return;
+		if (!active) return;
+		syncImagePermission(pi);
+		if (!state.enabled || !state.imagesAllowed || !state.illustrations || imageMode() === "off") return;
 		event.systemPromptOptions.sections.illustrated_render = [
 			"The terminal displays local SVG/PNG illustrations inside assistant Markdown.",
 			"When an explanation benefits from a diagram (especially physics), create a clear standalone SVG with the available file-writing tools, then place ![short caption](/absolute/path/to/diagram.svg) in its own paragraph, with blank lines before and after. Interleave diagrams with the relevant explanation rather than collecting them at the end.",
@@ -151,11 +168,12 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 		description: "图文渲染：status | images:on/off | images:bg:light/dark/none | images:height:56 | refresh",
 		getArgumentCompletions: (prefix) => COMMANDS.filter((value) => value.startsWith(prefix.trim()) && value !== prefix.trim()).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
+			if (active) syncImagePermission(pi);
 			const arg = args.trim().toLowerCase() || "status";
 			if (arg === "status" || !active) { ctx.ui.notify(statusText(), active ? "info" : "warning"); return; }
 			if (arg === "on" || arg === "off") state.enabled = arg === "on";
 			else if (arg === "images:on" || arg === "images:off") {
-				state.illustrations = arg === "images:on" && pi.getSettings().terminal?.showImages !== false;
+				state.illustrations = arg === "images:on";
 			} else if (arg === "images:bg:light" || arg === "images:bg:dark" || arg === "images:bg:none") {
 				state.imageBackground = arg.slice("images:bg:".length) as typeof state.imageBackground;
 			} else if (arg.startsWith("images:height:")) {

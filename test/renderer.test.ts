@@ -32,7 +32,7 @@ beforeEach(() => {
 	process.env.PI_BETTER_RENDER_IMAGES = "placeholder";
 	process.env.PI_BETTER_RENDER_FONT_DOWNLOAD = "0";
 	process.env.PI_BETTER_RENDER_MERMAID_INSTALL = "0";
-	state.enabled = state.illustrations = true;
+	state.enabled = state.imagesAllowed = state.illustrations = true;
 	state.imageBackground = "none";
 	state.imageMaxRows = 28;
 	state.math = "streaming";
@@ -82,6 +82,24 @@ test("relative base directories, percent escapes, file URLs, and literal percent
 	assert.equal(resolveImagePath(pathToFileURL(path).href, "/"), path);
 	assert.notEqual(service("/a").key, service("/b").key);
 	for (const path of ["https://example.test/x.svg", "//host/x.png", "data:image/png;base64,xx", "ftp://host/x"]) assert.throws(() => resolveImagePath(path, root), /本地/);
+});
+
+test("terminal permission gates cached illustration pixels independently of the illustration toggle", async () => {
+	const s = service();
+	const source = `![PNG 图](${png})`;
+	assert.ok((await ready(s, source)).join("").includes(PLACEHOLDER));
+	const key = s.key, rasterized = s.stats.rasterized;
+	state.imagesAllowed = false;
+	assert.notEqual(s.key, key);
+	writes = [];
+	const fallback = draw(s, source);
+	assert.ok(!fallback.join("").includes(PLACEHOLDER));
+	assert.match(plain(fallback), /terminal.showImages/);
+	assert.equal(writes.length, 0);
+	assert.equal(s.stats.rasterized, rasterized);
+	state.imagesAllowed = true;
+	assert.ok(draw(s, source).join("").includes(PLACEHOLDER));
+	assert.equal(s.stats.rasterized, rasterized);
 });
 
 test("same file with different captions keeps distinct copy sources", async () => {

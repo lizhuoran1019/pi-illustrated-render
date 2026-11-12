@@ -6,6 +6,8 @@ export type ImageBackground = "none" | "light" | "dark";
 export const state = {
 	/** Rich Markdown rendering replaces pi's built-in assistant Markdown. */
 	enabled: true,
+	/** Host terminal.showImages permission, shared by formulas and illustrations. */
+	imagesAllowed: true,
 	/** Local Markdown illustrations; independent of formula rendering. */
 	illustrations: true,
 	/** Preserve original alpha by default; backplates never recolor the image itself. */

@@ -35,7 +35,7 @@ export function clearFormulaCache(): void {
 }
 
 export function imagesAvailable(): boolean {
-	return imageMode() !== "off";
+	return state.imagesAllowed && imageMode() !== "off";
 }
 
 function remember(key: string, value: Placed | MathError): Placed | MathError {
@@ -162,7 +162,7 @@ export function createMathRenderer(getColor: () => string): MathRenderer {
 
 	return {
 		get key() {
-			return `${state.math}|${mathjaxReady() ? 1 : 0}|${imageMode()}|${getColor()}|${getCellDimensions().widthPx}x${getCellDimensions().heightPx}`;
+			return `${state.math}|${state.imagesAllowed}|${mathjaxReady() ? 1 : 0}|${imageMode()}|${getColor()}|${getCellDimensions().widthPx}x${getCellDimensions().heightPx}`;
 		},
 		inline(tex, _display, streaming, source, maxColumns = MAX_PLACEHOLDER_CELLS) {
 			if (!active(streaming)) return undefined;

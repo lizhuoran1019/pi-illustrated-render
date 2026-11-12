@@ -189,7 +189,7 @@ export class IllustrationService implements IllustrationRenderer {
 
 	get key(): string {
 		const cell = getCellDimensions();
-		return JSON.stringify([this.cwd, this.generation, state.illustrations, state.imageBackground, state.imageMaxRows, imageMode(), cell.widthPx, cell.heightPx]);
+		return JSON.stringify([this.cwd, this.generation, state.imagesAllowed, state.illustrations, state.imageBackground, state.imageMaxRows, imageMode(), cell.widthPx, cell.heightPx]);
 	}
 
 	/** Await scheduled reads (test/preview harness); rendering itself never blocks on I/O. */
@@ -244,6 +244,7 @@ export class IllustrationService implements IllustrationRenderer {
 	}
 
 	block(image: IllustrationRequest, maxColumns: number): IllustrationResult {
+		if (!state.imagesAllowed) return { status: "fallback", message: "终端图片已关闭（terminal.showImages）" };
 		if (this.disposed || !state.illustrations) return { status: "fallback", message: "图片显示已关闭" };
 		if (imageMode() === "off") return { status: "fallback", message: "终端不支持 Kitty 图像" };
 		try {
