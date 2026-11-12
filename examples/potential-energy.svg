@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="440" viewBox="0 0 1000 440">
+<rect width="1000" height="440" rx="22" fill="#f7fafc"/>
+<g font-family="Noto Sans CJK SC, Noto Sans CJK KR, sans-serif" fill="#172b4d">
+<text x="44" y="53" font-size="30" font-weight="bold">同一电势分布，正负电荷的势能变化相反</text>
+<text x="44" y="91" font-size="22" fill="#50627c">取 φ = 8 − 2x（V），分别放入 +1 C 与 −1 C 的试探电荷</text>
+<path d="M110 130V375 M110 250H600" stroke="#60758a" stroke-width="2.5" fill="none"/>
+<path d="M110 150L550 250" stroke="#e05a47" stroke-width="5" fill="none"/>
+<path d="M110 350L550 250" stroke="#009b8e" stroke-width="5" fill="none"/>
+<g font-size="22" fill="#50627c"><text x="45" y="156">+8 J</text><text x="68" y="257">0</text><text x="46" y="357">−8 J</text><text x="101" y="406">0</text><text x="542" y="406">4 m</text><text x="579" y="282">x</text></g>
+<path d="M550 256V380" stroke="#bdc9d5" stroke-dasharray="6 6"/>
+<circle cx="110" cy="150" r="6" fill="#e05a47"/><circle cx="110" cy="350" r="6" fill="#009b8e"/><circle cx="550" cy="250" r="6" fill="#172b4d"/>
+<g font-size="25"><text x="650" y="173" fill="#c64132">+1 C：Eₚ 从 8 J 降到 0</text><text x="650" y="287" fill="#007e74">−1 C：Eₚ 从 −8 J 升到 0</text></g>
+<g font-size="22" fill="#50627c"><text x="650" y="211">沿电场移动，势能降低</text><text x="650" y="325">沿电场移动，势能升高</text></g>
+</g></svg>

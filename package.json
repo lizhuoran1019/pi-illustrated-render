@@ -1,0 +1,38 @@
+{
+  "name": "pi-illustrated-render",
+  "version": "0.1.0",
+  "description": "Local SVG/PNG illustrations, math and CJK-friendly Markdown inside Pi assistant messages",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lizhuoran1019/pi-illustrated-render.git"
+  },
+  "homepage": "https://github.com/lizhuoran1019/pi-illustrated-render#readme",
+  "bugs": { "url": "https://github.com/lizhuoran1019/pi-illustrated-render/issues" },
+  "keywords": ["pi-package", "pi", "markdown", "kitty", "svg", "latex"],
+  "files": ["src", "vendor", "examples", "test", "tools", "tsconfig.json", "README.md", "THIRD_PARTY.md", "LICENSE"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-tui": "1.5.2",
+    "@types/node": "^22.19.0",
+    "@types/pngjs": "^6.0.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

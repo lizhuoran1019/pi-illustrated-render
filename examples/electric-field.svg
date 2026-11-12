@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="620" viewBox="0 0 1000 620">
+<defs>
+  <marker id="arrowBlue" markerWidth="20" markerHeight="20" refX="17" refY="10" orient="auto" markerUnits="userSpaceOnUse"><path d="M2 2L18 10L2 18Z" fill="#3458d3"/></marker>
+  <marker id="arrowRed" markerWidth="22" markerHeight="22" refX="19" refY="11" orient="auto" markerUnits="userSpaceOnUse"><path d="M2 2L20 11L2 20Z" fill="#d54d36"/></marker>
+  <marker id="arrowTeal" markerWidth="22" markerHeight="22" refX="19" refY="11" orient="auto" markerUnits="userSpaceOnUse"><path d="M2 2L20 11L2 20Z" fill="#087f78"/></marker>
+  <marker id="arrowGray" markerWidth="16" markerHeight="16" refX="13" refY="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M2 2L14 8L2 14Z" fill="#64748b"/></marker>
+</defs>
+<rect width="1000" height="620" rx="18" fill="#ffffff"/>
+<g font-family="Noto Sans CJK SC, Noto Sans CJK KR, sans-serif" fill="#192840">
+  <text x="50" y="58" font-size="34" font-weight="700">同一电场中，正负电荷受力相反</text>
+  <text x="50" y="99" font-size="23" fill="#58677f">分别放入 +q 和 −q（q &gt; 0），比较它们受到的电场力</text>
+  <text x="500" y="143" text-anchor="middle" font-size="25" fill="#3458d3">电场 E = 2 V/m</text>
+  <path d="M150 165H850" stroke="#3458d3" stroke-width="5" fill="none" marker-end="url(#arrowBlue)"/>
+  <g stroke="#d8e0eb" stroke-width="2" stroke-dasharray="7 8">
+    <path d="M150 233V490"/><path d="M500 233V490"/><path d="M850 233V490"/>
+  </g>
+  <g font-size="26" text-anchor="middle">
+    <text x="150" y="214">φ = 8 V</text>
+    <text x="500" y="214">φ = 4 V</text>
+    <text x="850" y="214">φ = 0 V</text>
+  </g>
+  <text x="235" y="311" font-size="28" fill="#d54d36">正电荷</text>
+  <circle cx="500" cy="300" r="32" fill="#fff0e9" stroke="#d54d36" stroke-width="3"/>
+  <text x="500" y="309" text-anchor="middle" font-size="26" font-weight="700" fill="#d54d36">+q</text>
+  <path d="M540 300H740" stroke="#d54d36" stroke-width="6" stroke-linecap="round" fill="none" marker-end="url(#arrowRed)"/>
+  <text x="645" y="282" text-anchor="middle" font-size="25" fill="#d54d36">电场力</text>
+  <text x="650" y="431" font-size="28" fill="#087f78">负电荷</text>
+  <circle cx="500" cy="420" r="32" fill="#e8f7f3" stroke="#087f78" stroke-width="3"/>
+  <text x="500" y="429" text-anchor="middle" font-size="26" font-weight="700" fill="#087f78">−q</text>
+  <path d="M460 420H260" stroke="#087f78" stroke-width="6" stroke-linecap="round" fill="none" marker-end="url(#arrowTeal)"/>
+  <text x="355" y="402" text-anchor="middle" font-size="25" fill="#087f78">电场力</text>
+  <path d="M130 515H909" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrowGray)"/>
+  <g stroke="#64748b" stroke-width="2"><path d="M150 509V522"/><path d="M500 509V522"/><path d="M850 509V522"/></g>
+  <g font-size="23" text-anchor="middle" fill="#58677f">
+    <text x="150" y="550">0</text><text x="500" y="550">2</text><text x="850" y="550">4</text>
+  </g>
+  <text x="923" y="523" font-size="23" fill="#58677f">x/m</text>
+  <text x="50" y="595" font-size="24">向右电势降低；但只有正电荷的电场力也向右。</text>
+</g>
+</svg>
