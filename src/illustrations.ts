@@ -185,7 +185,7 @@ export class IllustrationService implements IllustrationRenderer {
 	private rasterBytes = 0;
 	readonly stats = { rasterized: 0, rasterHits: 0 };
 	private disposed = false;
-	constructor(private readonly cwd: string, private readonly changed = () => { bumpVersion(); requestRender(); }) {}
+	constructor(private readonly cwd: string, private readonly changed = () => { bumpVersion(); requestRender(); }, private readonly managed?: { resolvePath(path: string): string; prepare(path: string): Promise<void> }) {}
 
 	get key(): string {
 		const cell = getCellDimensions();
@@ -217,7 +217,7 @@ export class IllustrationService implements IllustrationRenderer {
 		const pending: ResourceEntry = { status: "pending" };
 		this.resources.set(path, pending);
 		const generation = this.generation;
-		const job = readResource(path).then(
+		const job = Promise.resolve().then(() => this.managed?.prepare(path)).then(() => readResource(path)).then(
 			(value): ResourceEntry => ({ status: "ready", value }),
 			(error): ResourceEntry => ({ status: "error", message: errorText(error) }),
 		).then((entry) => {
@@ -248,7 +248,8 @@ export class IllustrationService implements IllustrationRenderer {
 		if (this.disposed || !state.illustrations) return { status: "fallback", message: "图片显示已关闭" };
 		if (imageMode() === "off") return { status: "fallback", message: "终端不支持 Kitty 图像" };
 		try {
-			const path = resolveImagePath(image.href, this.cwd);
+			const originalPath = resolveImagePath(image.href, this.cwd);
+			const path = this.managed?.resolvePath(originalPath) ?? originalPath;
 			const cell = getCellDimensions();
 			let size = this.sizes.get(path);
 			if (!size) {

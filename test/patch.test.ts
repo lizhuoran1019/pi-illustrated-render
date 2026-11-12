@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AssistantMessageComponent, initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, setCapabilities, setCellDimensions, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { fileURLToPath } from "node:url";
@@ -18,8 +21,18 @@ type Message = NonNullable<ConstructorParameters<typeof AssistantMessageComponen
 const message = (text: string): Message => ({ role: "assistant", content: [{ type: "text", text }], api: "openai-completions", provider: "test", model: "fixture", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 });
 const render = (c: AssistantMessageComponent) => c.render(90).map(stripTerminalSequences).join("\n");
 
-beforeEach(() => { initTheme("dark"); state.enabled = state.imagesAllowed = state.illustrations = true; state.math = "streaming"; state.imageBackground = "none"; state.imageMaxRows = 28; });
-afterEach(() => { removePatch(); AssistantMessageComponent.prototype.updateContent = original; });
+const initialAgentDir = process.env.PI_CODING_AGENT_DIR;
+let agentDir: string;
+beforeEach(async () => {
+	agentDir = await mkdtemp(join(tmpdir(), "pi-diagram-hooks-"));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	initTheme("dark"); state.enabled = state.imagesAllowed = state.illustrations = true; state.math = "streaming"; state.imageBackground = "none"; state.imageMaxRows = 28;
+});
+afterEach(async () => {
+	removePatch(); AssistantMessageComponent.prototype.updateContent = original;
+	if (initialAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = initialAgentDir;
+	await rm(agentDir, { recursive: true, force: true });
+});
 
 test("actual assistant slots survive repeated streaming updates; transforms and stored content stay intact", () => {
 	let calls = 0;
@@ -75,7 +88,7 @@ test("conflict detection uses registered source metadata before startup ordering
 
 test("an exact command argument closes completion so Enter submits it", async () => {
 	let definition: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
-	const api = { on() {}, registerCommand: (_name: string, command: NonNullable<typeof definition>) => { definition = command; } } as unknown as ExtensionAPI;
+	const api = { on() {}, registerTool() {}, registerCommand: (_name: string, command: NonNullable<typeof definition>) => { definition = command; } } as unknown as ExtensionAPI;
 	extension(api);
 	assert.deepEqual(await definition!.getArgumentCompletions!("images:off"), []);
 	const matches = await definition!.getArgumentCompletions!("images:o");
@@ -86,9 +99,10 @@ test("image controls validate height, update cache identity and expose current l
 	const hooks = new Map<string, (...args: any[]) => any>();
 	let definition: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
 	const notices: { text: string; level: string }[] = [];
+	let activeTools = ["render_mermaid", "render_svg"];
 	let renders = 0;
 	const tui = { mode: "fullscreen", terminal: { write() {} }, invalidate() {}, requestRender() { renders++; }, getActiveSelectionText() { return undefined; } };
-	const ctx = { mode: "tui", cwd: "/tmp", ui: {
+	const ctx = { mode: "tui", cwd: "/tmp", sessionManager: { getBranch: () => [] }, ui: {
 		setWidget(_name: string, factory?: (tui: unknown) => unknown) { factory?.(tui); },
 		notify(text: string, level: string) { notices.push({ text, level }); },
 	} };
@@ -96,6 +110,7 @@ test("image controls validate height, update cache identity and expose current l
 		on: (name: string, fn: (...args: any[]) => any) => { hooks.set(name, fn); },
 		registerCommand(_name: string, command: NonNullable<typeof definition>) { definition = command; },
 		getCommands: () => [], getSettings: () => ({ terminal: { showImages: true } }),
+		registerTool() {}, getActiveTools: () => activeTools,
 	} as unknown as ExtensionAPI;
 	extension(api);
 	await hooks.get("session_start")!({}, ctx);
@@ -120,6 +135,19 @@ test("image controls validate height, update cache identity and expose current l
 		hooks.get("before_agent_start")!(prompt);
 		assert.match(prompt.systemPromptOptions.sections.illustrated_render!, /56 terminal rows/);
 		assert.match(prompt.systemPromptOptions.sections.illustrated_render!, /display math/);
+		assert.match(prompt.systemPromptOptions.sections.illustrated_render!, /prefer render_mermaid/);
+		assert.match(prompt.systemPromptOptions.sections.illustrated_render!, /bounded cache/);
+		assert.ok(!prompt.systemPromptOptions.sections.illustrated_render!.includes("physics"));
+		assert.ok(!prompt.systemPromptOptions.sections.illustrated_render!.includes(".pi/diagrams"));
+		activeTools = ["render_mermaid"];
+		const limited = { systemPromptOptions: { sections: {} as Record<string, string> } };
+		hooks.get("before_agent_start")!(limited);
+		assert.match(limited.systemPromptOptions.sections.illustrated_render!, /render_mermaid/);
+		assert.ok(!limited.systemPromptOptions.sections.illustrated_render!.includes("render_svg"));
+		activeTools = [];
+		const disabled = { systemPromptOptions: { sections: {} as Record<string, string> } };
+		hooks.get("before_agent_start")!(disabled);
+		assert.equal(disabled.systemPromptOptions.sections.illustrated_render, undefined);
 		assert.deepEqual(await definition!.getArgumentCompletions!("images:bg:light"), []);
 		assert.deepEqual(await definition!.getArgumentCompletions!("images:height:56"), []);
 	} finally { hooks.get("session_shutdown")!(); }
@@ -133,7 +161,7 @@ async function terminalHarness(showImages: boolean) {
 	const settings = { terminal: { showImages } };
 	const notices: string[] = [], writes: string[] = [];
 	const tui = { mode: "fullscreen", terminal: { write(data: string) { writes.push(data); } }, invalidate() {}, requestRender() {}, doRender() {}, resetRenderState() {}, getActiveSelectionText() { return undefined; } };
-	const ctx = { mode: "tui", cwd: fileURLToPath(new URL("../", import.meta.url)), ui: {
+	const ctx = { mode: "tui", cwd: fileURLToPath(new URL("../", import.meta.url)), sessionManager: { getBranch: () => [] }, ui: {
 		setWidget(_name: string, factory?: (tui: unknown) => unknown) { factory?.(tui); },
 		notify(text: string) { notices.push(text); },
 	} };
@@ -141,6 +169,7 @@ async function terminalHarness(showImages: boolean) {
 		on: (name: string, fn: (...args: any[]) => any) => { hooks.set(name, fn); },
 		registerCommand(_name: string, definition: NonNullable<typeof command>) { command = definition; },
 		getCommands: () => [], getSettings: () => settings,
+		registerTool() {}, getActiveTools: () => ["render_mermaid", "render_svg"],
 	} as unknown as ExtensionAPI);
 	await hooks.get("session_start")!({}, ctx);
 	return {
@@ -234,9 +263,9 @@ test("direct fullscreen frames reset only on real renders and release their inst
 
 test("extension never registers context/message mutation hooks and skips RPC rendering", async () => {
 	const hooks = new Map<string, (...args: any[]) => any>();
-	const api = { on: (name: string, fn: (...args: any[]) => any) => { hooks.set(name, fn); }, registerCommand() {} } as unknown as ExtensionAPI;
+	const api = { on: (name: string, fn: (...args: any[]) => any) => { hooks.set(name, fn); }, registerCommand() {}, registerTool() {} } as unknown as ExtensionAPI;
 	extension(api);
-	assert.deepEqual([...hooks.keys()].sort(), ["before_agent_start", "session_shutdown", "session_start"]);
-	await hooks.get("session_start")!({}, { mode: "rpc" });
+	assert.deepEqual([...hooks.keys()].sort(), ["before_agent_start", "session_shutdown", "session_start", "session_tree"]);
+	await hooks.get("session_start")!({}, { mode: "rpc", sessionManager: { getBranch: () => [] } });
 	assert.equal(isPatched(), false);
 });

@@ -1,7 +1,8 @@
-/** pi-illustrated-render: display-only assistant Markdown with local illustrations. */
+/** Assistant Markdown rendering and local, cache-managed diagram authoring. */
 import { type ExtensionAPI, type ExtensionContext, copyToClipboard, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { IllustrationService } from "./illustrations.ts";
 import { installDirectRedraw } from "./direct-redraw.ts";
+import { registerDiagramTools } from "./diagrams/tools.ts";
 import { forgetFormulaSources, installCopyHook, type SelectionHost } from "./math/copy.ts";
 import { createMathRenderer, clearFormulaCache } from "./math/formula.ts";
 import { deleteImages, forgetImages, imageMode, installFrameHook } from "./math/kitty.ts";
@@ -114,15 +115,18 @@ function statusText(): string {
 		`终端图片：${state.imagesAllowed ? "允许" : "关闭（terminal.showImages）；公式使用文字"} · 图像通道：${imageMode()}`,
 		`插图背景：${state.imageBackground} · 预览高度：${state.imageMaxRows} 行`,
 		`SVG/PNG：本地文件，上限 8 MiB · 图下链接可查看原图`,
+		`图示工具：Pele Mermaid / SVG · diagrams:cache 查看磁盘缓存`,
 		`公式引擎：${mathjaxReady() ? "MathJax + resvg" : mathjaxError() ?? "加载中…"}`,
 	].join("\n");
 }
 
-const COMMANDS = ["status", "on", "off", "images:on", "images:off", "images:bg:light", "images:bg:dark", "images:bg:none", "images:height:28", "images:height:56", "images:height:84", "math:streaming", "math:final", "math:off", "lines", "mermaid", "refresh", "clear-cache"];
+const COMMANDS = ["status", "on", "off", "images:on", "images:off", "images:bg:light", "images:bg:dark", "images:bg:none", "images:height:28", "images:height:56", "images:height:84", "math:streaming", "math:final", "math:off", "lines", "mermaid", "diagrams:cache", "diagrams:clear-cache", "refresh", "clear-cache"];
 
 export default function piIllustratedRender(pi: ExtensionAPI): void {
-	pi.on("session_start", (_event, ctx) => {
+	const diagrams = registerDiagramTools(pi);
+	pi.on("session_start", async (_event, ctx) => {
 		stop();
+		await diagrams.start(ctx);
 		if (ctx.mode !== "tui") return;
 		if (hasCompetingRenderer(pi.getCommands())) {
 			inactiveReason = "请先在 pi config 中禁用 pi-better-render，然后 /reload；两个渲染器不能同时启用";
@@ -134,7 +138,7 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 			if (!captureTui(ctx)) throw new Error("无法取得 TUI 图像输出通道");
 			syncImagePermission(pi);
 			state.illustrations = true;
-			illustrations = new IllustrationService(ctx.cwd);
+			illustrations = new IllustrationService(ctx.cwd, undefined, diagrams);
 			if (!applyPatch((text, paddingX, streaming, transform) => new RichMarkdown(text, {
 				style: () => { syncImagePermission(pi); return currentStyle(); }, math, illustrations, streaming, paddingX, transform,
 				copyCode: tui?.mode === "fullscreen" ? copyToClipboard : undefined,
@@ -152,15 +156,25 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_shutdown", stop);
+	pi.on("session_shutdown", () => { stop(); diagrams.stop(); });
+	pi.on("session_tree", (_event, ctx) => {
+		diagrams.restore(ctx);
+		illustrations?.clear();
+		clearBlockCache();
+		refreshAll();
+	});
 	pi.on("before_agent_start", (event) => {
 		if (!active) return;
 		syncImagePermission(pi);
 		if (!state.enabled || !state.imagesAllowed || !state.illustrations || imageMode() === "off") return;
+		const available = new Set(pi.getActiveTools());
+		if (!available.has("render_mermaid")) return;
 		event.systemPromptOptions.sections.illustrated_render = [
 			"The terminal displays local SVG/PNG illustrations inside assistant Markdown.",
-			"When an explanation benefits from a diagram (especially physics), create a clear standalone SVG with the available file-writing tools, then place ![short caption](/absolute/path/to/diagram.svg) in its own paragraph, with blank lines before and after. Interleave diagrams with the relevant explanation rather than collecting them at the end.",
-			`Use persistent project paths (for example .pi/diagrams/), not temporary files, so resumed sessions retain illustrations. SVGs must be self-contained vectors with no external resources, DTD or embedded images. PNG is also supported. Limits: 8 MiB, 16 million pixels. Use generous labels and a high-contrast background; the preview fits within 100 columns and ${state.imageMaxRows} terminal rows and links to the original file. Split dense or tall diagrams into focused illustrations when useful. Put complex fractions, integrals and long equations in display math rather than shrinking them into inline math. Do not output raw SVG into the reply or download remote images merely to display them.`,
+			"When a diagram helps explain a concept, process, relationship or structure, prefer render_mermaid (local Pele). Repair Mermaid syntax errors.",
+			available.has("render_svg") ? "Use render_svg for custom geometry or notation that Mermaid cannot express; a failed Mermaid attempt is not required when it is clearly unsuitable." : "If Mermaid cannot express the diagram, explain it in text or use an existing local figure.",
+			"Embed the returned Markdown image reference in its own paragraph with blank lines around it, beside the relevant explanation. Do not gather all figures at the end or paste raw SVG into the reply. Ordinary diagrams belong in the tools\' bounded cache: omit exportPath unless the user asks for a permanent export. The session retains source recipes so cleaned-up cache files can be rebuilt. Do not write explanatory diagrams into persistent project directories merely to display them.",
+			`Use generous labels and high contrast; the preview fits within 100 columns and ${state.imageMaxRows} terminal rows and links to the original file. Split dense or tall diagrams into focused illustrations. Put complex fractions, integrals and long equations in display math instead of shrinking them into inline math. Existing local SVG/PNG files can still be embedded directly. Do not download remote images merely to display them.`,
 		].join("\n");
 	});
 
@@ -170,6 +184,14 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			if (active) syncImagePermission(pi);
 			const arg = args.trim().toLowerCase() || "status";
+			if (arg === "diagrams:cache" || arg === "diagrams:clear-cache") {
+				try {
+					const text = arg === "diagrams:cache" ? await diagrams.status(ctx) : await diagrams.clear(ctx);
+					if (arg === "diagrams:clear-cache") { dropCaches(true); refreshAll(); }
+					ctx.ui.notify(text, "info");
+				} catch (error) { ctx.ui.notify(`图示缓存操作失败：${String(error)}`, "error"); }
+				return;
+			}
 			if (arg === "status" || !active) { ctx.ui.notify(statusText(), active ? "info" : "warning"); return; }
 			if (arg === "on" || arg === "off") state.enabled = arg === "on";
 			else if (arg === "images:on" || arg === "images:off") {
