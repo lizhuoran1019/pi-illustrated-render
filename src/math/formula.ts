@@ -164,9 +164,9 @@ export function createMathRenderer(getColor: () => string): MathRenderer {
 		get key() {
 			return `${state.math}|${mathjaxReady() ? 1 : 0}|${imageMode()}|${getColor()}|${getCellDimensions().widthPx}x${getCellDimensions().heightPx}`;
 		},
-		inline(tex, _display, streaming, source) {
+		inline(tex, _display, streaming, source, maxColumns = MAX_PLACEHOLDER_CELLS) {
 			if (!active(streaming)) return undefined;
-			const placed = place(tex, false, MAX_PLACEHOLDER_CELLS, 1);
+			const placed = place(tex, false, maxColumns, 1);
 			if (!placed) return undefined;
 			rememberFormulaSource(placed.id, source ?? `$${tex}$`, false);
 			return placeholderRows(placed.id, placed.columns, 1)[0];

@@ -1,8 +1,7 @@
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
+import { hyperlink, sliceByColumn, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { renderCode } from "./code.ts";
 import { offsetCodeActions, type RenderContext } from "./context.ts";
 import { latexFallback, renderInline } from "./inline.ts";
-import { lexInline } from "./lexer.ts";
 import { renderTable } from "./table.ts";
 import { visibleWidth, wrap } from "./util.ts";
 
@@ -88,7 +87,16 @@ function renderIllustration(token: any, ctx: RenderContext): string[] | undefine
 	}
 	const left = " ".repeat(Math.max(0, Math.floor((ctx.width - result.columns) / 2)));
 	const lines = result.lines.map((line) => left + line);
-	if (alt) lines.push(...wrap(ctx.style.fg("muted", alt), ctx.width));
+	if (alt) {
+		let caption = wrap(alt, result.columns);
+		// Avoid leaving a lone CJK character or closing punctuation under a wide figure.
+		if (result.columns >= 8 && caption.length > 1 && visibleWidth(caption.at(-1)!) <= 2) caption = wrap(alt, result.columns - 2);
+		lines.push(...caption.map((line) => left + ctx.style.fg("muted", line)));
+	}
+	if (result.sourceUrl) {
+		const label = result.columns >= 8 ? "查看原图" : result.columns >= 4 ? "原图" : result.columns >= 2 ? "图" : "↗";
+		lines.push(left + hyperlink(ctx.style.fg("mdLink", safeText(label)), result.sourceUrl));
+	}
 	return lines;
 }
 
@@ -140,14 +148,15 @@ function renderList(token: any, ctx: RenderContext): string[] {
 			marker = token.ordered ? `${marker} ${box}` : box;
 			markerWidth = token.ordered ? markerWidth + 2 : 1;
 		}
-		const indent = markerWidth + 1;
-		const childCtx: RenderContext = { ...offsetCodeActions(ctx, indent, out.length + (index > 0 && token.loose ? 1 : 0)), width: Math.max(1, ctx.width - indent), listDepth: ctx.listDepth + 1 };
+		const indent = Math.min(markerWidth + 1, Math.max(0, ctx.width - 2));
+		const prefix = sliceByColumn(marker + " ", 0, indent, true);
+		const childCtx: RenderContext = { ...offsetCodeActions(ctx, indent, out.length + (index > 0 && token.loose ? 1 : 0)), width: ctx.width - indent, listDepth: ctx.listDepth + 1 };
 		const tokens = (item.tokens ?? []).filter((t: any) => t.type !== "checkbox");
 		const body = renderBlocks(tokens, childCtx, !item.loose);
 		const lines = body.length > 0 ? body : [""];
 		if (index > 0 && token.loose) out.push("");
 		lines.forEach((line, i) => {
-			out.push((i === 0 ? marker + " " : " ".repeat(indent)) + line);
+			out.push((i === 0 ? prefix : " ".repeat(indent)) + line);
 		});
 	});
 	return out;
@@ -165,23 +174,33 @@ function renderQuote(token: any, ctx: RenderContext): string[] {
 		if (m) {
 			callout = CALLOUTS[m[1]!.toUpperCase()];
 			const rest = String(first.raw).slice(m[0].length);
+			let remaining = m[0].length;
+			const inline = (first.tokens ?? []).flatMap((part: any) => {
+				if (remaining === 0) return [part];
+				const raw = String(part.raw ?? "");
+				const removed = Math.min(remaining, raw.length);
+				remaining -= removed;
+				return removed === raw.length ? [] : [{ ...part, raw: raw.slice(removed), text: String(part.text).slice(removed) }];
+			});
 			tokens = rest.trim()
-				? [{ type: "paragraph", raw: rest, tokens: lexInline(rest.trim()) }, ...tokens.slice(1)]
+				? [{ ...first, raw: rest, text: rest, tokens: inline }, ...tokens.slice(1)]
 				: tokens.slice(1);
 		}
 	}
 
 	const color = callout?.color ?? "mdQuoteBorder";
 	const bar = style.fg(color, "▎");
+	const indent = Math.min(2, Math.max(0, ctx.width - 2));
+	const prefix = indent === 2 ? `${bar} ` : indent === 1 ? bar : "";
+	const header = callout ? wrap(style.bold(style.fg(callout.color, `${callout.icon} ${callout.label}`)), ctx.width - indent) : [];
 	const innerCtx: RenderContext = {
-		...offsetCodeActions(ctx, 2, callout ? 1 : 0),
-		width: Math.max(1, ctx.width - 2),
+		...offsetCodeActions(ctx, indent, header.length),
+		width: ctx.width - indent,
 		textStyle: callout ? ctx.textStyle : (t) => style.fg("mdQuote", t),
 	};
 	const body = renderBlocks(tokens, innerCtx);
-	const lines: string[] = [];
-	if (callout) lines.push(`${bar} ${style.bold(style.fg(callout.color, `${callout.icon} ${callout.label}`))}`);
-	for (const line of body) lines.push(`${bar} ${line}`);
+	const lines = header.map((line) => prefix + line);
+	for (const line of body) lines.push(prefix + line);
 	return lines.length > 0 ? lines : [bar];
 }
 

@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { inflateSync } from "node:zlib";
 import { Resvg } from "@resvg/resvg-js";
 import { PNG } from "pngjs";
@@ -17,12 +17,13 @@ export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_PIXELS = 16_000_000;
 const CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_COLUMNS = 100;
-const MAX_ROWS = 28;
 const MAX_RASTER_SIDE = 4096;
 
-interface Resource { svg: string; width: number; height: number }
+interface Size { width: number; height: number }
+interface Resource extends Size { svg: string }
 type ResourceEntry = { status: "pending" } | { status: "ready"; value: Resource } | { status: "error"; message: string };
-interface Placement { id: number; base64: string; columns: number; rows: number }
+interface Raster { base64: string; columns: number; rows: number }
+const BACKGROUNDS = { light: "#ffffff", dark: "#171a21", none: undefined } as const;
 
 /** Decode Markdown URL escapes, but preserve ordinary filenames containing a literal %. */
 export function resolveImagePath(href: string, cwd: string): string {
@@ -140,7 +141,7 @@ async function readResource(path: string): Promise<Resource> {
 	const svg = data.toString("utf8");
 	checkSvg(svg);
 	// Parse once and convert text to paths using system fonts; no font download.
-	const parsed = new Resvg(svg, { font: { loadSystemFonts: true, defaultFontFamily: "sans-serif" } });
+	const parsed = new Resvg(svg, { font: { loadSystemFonts: /<(?:[A-Za-z_][\w.-]*:)?text[\s/>]/.test(svg), defaultFontFamily: "sans-serif" } });
 	checkDimensions(parsed.width, parsed.height);
 	if (parsed.imagesToResolve().length) throw new Error("SVG 不支持外部资源");
 	const normalized = parsed.toString();
@@ -157,9 +158,10 @@ function errorText(error: unknown): string {
 }
 
 /** Size on an exact cell canvas; aspect ratio is preserved even with fractional cell sizes. */
-export function rasterLayout(width: number, height: number, maxColumns: number, cellW: number, cellH: number) {
+export function rasterLayout(width: number, height: number, maxColumns: number, cellW: number, cellH: number, maxRows = 28) {
 	const columnsLimit = Math.max(1, Math.min(MAX_COLUMNS, MAX_PLACEHOLDER_CELLS, Math.floor(maxColumns)));
-	const scale = Math.min(1, columnsLimit * cellW / width, MAX_ROWS * cellH / height,
+	const rowsLimit = Math.max(1, Math.min(MAX_PLACEHOLDER_CELLS, Math.floor(maxRows)));
+	const scale = Math.min(1, columnsLimit * cellW / width, rowsLimit * cellH / height,
 		MAX_RASTER_SIDE / (2 * width), MAX_RASTER_SIDE / (2 * height));
 	const contentW = width * scale;
 	const contentH = height * scale;
@@ -172,17 +174,22 @@ export function rasterLayout(width: number, height: number, maxColumns: number, 
 export class IllustrationService implements IllustrationRenderer {
 	private resources = new Map<string, ResourceEntry>();
 	private resident = new Map<string, Resource>();
-	private placements = new Map<string, Placement>();
+	/** Small geometry records let cached pixels outlive their parsed source. */
+	private sizes = new Map<string, Size>();
+	private rasters = new Map<string, Raster>();
+	/** Copy identity is separate from pixels: two captions can share one raster. */
+	private placements = new Map<string, number>();
 	private jobs = new Set<Promise<void>>();
 	private generation = 0;
 	private resourceBytes = 0;
-	private placementBytes = 0;
+	private rasterBytes = 0;
+	readonly stats = { rasterized: 0, rasterHits: 0 };
 	private disposed = false;
 	constructor(private readonly cwd: string, private readonly changed = () => { bumpVersion(); requestRender(); }) {}
 
 	get key(): string {
 		const cell = getCellDimensions();
-		return JSON.stringify([this.cwd, this.generation, state.illustrations, imageMode(), cell.widthPx, cell.heightPx]);
+		return JSON.stringify([this.cwd, this.generation, state.illustrations, state.imageBackground, state.imageMaxRows, imageMode(), cell.widthPx, cell.heightPx]);
 	}
 
 	/** Await scheduled reads (test/preview harness); rendering itself never blocks on I/O. */
@@ -192,8 +199,11 @@ export class IllustrationService implements IllustrationRenderer {
 		this.generation++;
 		this.resources.clear();
 		this.resident.clear();
+		this.sizes.clear();
+		this.rasters.clear();
 		this.placements.clear();
-		this.resourceBytes = this.placementBytes = 0;
+		this.resourceBytes = this.rasterBytes = 0;
+		this.stats.rasterized = this.stats.rasterHits = 0;
 	}
 
 	dispose(): void { this.disposed = true; this.clear(); }
@@ -216,6 +226,7 @@ export class IllustrationService implements IllustrationRenderer {
 			if (entry.status === "ready") {
 				this.resourceBytes += entry.value.svg.length;
 				this.resident.set(path, entry.value);
+				this.sizes.set(path, { width: entry.value.width, height: entry.value.height });
 			}
 			while (this.resident.size > 64 || this.resourceBytes > CACHE_BYTES) {
 				const first = this.resident.keys().next().value!;
@@ -238,31 +249,50 @@ export class IllustrationService implements IllustrationRenderer {
 		try {
 			const path = resolveImagePath(image.href, this.cwd);
 			const cell = getCellDimensions();
-			const key = JSON.stringify([path, image.source, maxColumns, cell.widthPx, cell.heightPx]);
-			let placed = this.placements.get(key);
-			if (!placed) {
+			let size = this.sizes.get(path);
+			if (!size) {
 				const resource = this.resource(path);
 				if (resource.status === "pending") return { status: "fallback", message: "图片加载中…" };
 				if (resource.status === "error") return { status: "fallback", message: resource.message };
-				const { width, height, svg } = resource.value;
-				const layout = rasterLayout(width, height, maxColumns, cell.widthPx, cell.heightPx);
-				const { contentW, contentH, canvasW, canvasH, columns, rows } = layout;
+				size = resource.value;
+			}
+			const { width, height } = size;
+			const { contentW, contentH, canvasW, canvasH, columns, rows } = rasterLayout(width, height, maxColumns, cell.widthPx, cell.heightPx, state.imageMaxRows);
+			// Window width and caption do not identify pixels. Reuse the exact canvas
+			// whenever the final scale and cell grid are unchanged (e.g. 110 → 109 cols).
+			const key = JSON.stringify([path, contentW, contentH, canvasW, canvasH, columns, rows, state.imageBackground]);
+			let raster = this.rasters.get(key);
+			if (raster) {
+				this.rasters.delete(key);
+				this.rasters.set(key, raster);
+				this.stats.rasterHits++;
+			} else {
+				const resource = this.resource(path);
+				if (resource.status === "pending") return { status: "fallback", message: "图片加载中…" };
+				if (resource.status === "error") return { status: "fallback", message: resource.message };
 				const x = (canvasW - contentW * 2) / 2;
 				const y = (canvasH - contentH * 2) / 2;
-				const canvas = `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasW}" height="${canvasH}"><g transform="translate(${x},${y}) scale(${contentW * 2 / width})">${svg}</g></svg>`;
-				const base64 = new Resvg(canvas, { font: { loadSystemFonts: false } }).render().asPng().toString("base64");
-				placed = { id: allocateId(), base64, columns, rows };
-				this.placements.set(key, placed);
-				this.placementBytes += base64.length;
-				while (this.placements.size > 128 || this.placementBytes > CACHE_BYTES) {
-					const first = this.placements.keys().next().value!;
-					this.placementBytes -= this.placements.get(first)!.base64.length;
-					this.placements.delete(first);
+				const canvas = `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasW}" height="${canvasH}"><g transform="translate(${x},${y}) scale(${contentW * 2 / width})">${resource.value.svg}</g></svg>`;
+				const base64 = new Resvg(canvas, { font: { loadSystemFonts: false }, background: BACKGROUNDS[state.imageBackground] }).render().asPng().toString("base64");
+				raster = { base64, columns, rows };
+				this.rasters.set(key, raster);
+				this.rasterBytes += base64.length;
+				this.stats.rasterized++;
+				while (this.rasters.size > 128 || this.rasterBytes > CACHE_BYTES) {
+					const first = this.rasters.keys().next().value!;
+					this.rasterBytes -= this.rasters.get(first)!.base64.length;
+					this.rasters.delete(first);
 				}
 			}
-			registerImage(placed.id, placed.base64, placed.columns, placed.rows);
-			rememberFormulaSource(placed.id, image.source, true);
-			return { status: "ready", lines: placeholderRows(placed.id, placed.columns, placed.rows), columns: placed.columns };
+			const placementKey = JSON.stringify([key, image.source]);
+			let id = this.placements.get(placementKey);
+			if (id === undefined) id = allocateId();
+			this.placements.delete(placementKey);
+			this.placements.set(placementKey, id);
+			if (this.placements.size > 512) this.placements.delete(this.placements.keys().next().value!);
+			registerImage(id, raster.base64, raster.columns, raster.rows);
+			rememberFormulaSource(id, image.source, true);
+			return { status: "ready", lines: placeholderRows(id, raster.columns, raster.rows), columns: raster.columns, sourceUrl: pathToFileURL(path).href };
 		} catch (error) {
 			return { status: "fallback", message: errorText(error) };
 		}

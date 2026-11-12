@@ -5,8 +5,10 @@ export interface MathRenderer {
 	/**
 	 * Single-row image placeholder string for an inline formula. `source` is
 	 * its Markdown, delimiters included, which a copied selection gets back.
+	 * Optional `maxColumns` is the whole line budget, not its remaining space;
+	 * callers without it retain the original unconstrained inline behavior.
 	 */
-	inline(tex: string, display: boolean, streaming: boolean, source?: string): string | undefined;
+	inline(tex: string, display: boolean, streaming: boolean, source?: string, maxColumns?: number): string | undefined;
 	/** Placeholder rows for a display formula no wider than `maxColumns`. */
 	block(tex: string, maxColumns: number, streaming: boolean, source?: string): string[] | undefined;
 	/** Part of every cache key: changes when image output would change. */
@@ -14,7 +16,8 @@ export interface MathRenderer {
 }
 
 export interface IllustrationRequest { href: string; alt: string; source: string }
-export type IllustrationResult = { status: "ready"; lines: string[]; columns: number } | { status: "fallback"; message: string };
+/** `sourceUrl`, when present, is an escaped file:// URL supplied by the image service. */
+export type IllustrationResult = { status: "ready"; lines: string[]; columns: number; sourceUrl?: string } | { status: "fallback"; message: string };
 export interface IllustrationRenderer {
 	readonly key: string;
 	block(image: IllustrationRequest, maxColumns: number): IllustrationResult;

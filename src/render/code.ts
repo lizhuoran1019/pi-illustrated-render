@@ -17,7 +17,19 @@ function hardWrap(line: string, width: number): string[] {
 	const total = visibleWidth(line);
 	if (total <= width) return [line];
 	const out: string[] = [];
-	for (let col = 0; col < total; col += width) out.push(sliceByColumn(line, col, width, true));
+	for (let col = 0; col < total;) {
+		const piece = sliceByColumn(line, col, width, true);
+		const consumed = visibleWidth(piece);
+		if (consumed > 0) {
+			out.push(piece);
+			col += consumed;
+		} else {
+			// A two-cell grapheme cannot fit a one-cell terminal. Consume it
+			// whole and show a bounded replacement rather than looping/dropping it.
+			out.push("�");
+			col += visibleWidth(sliceByColumn(line, col, width));
+		}
+	}
 	return out;
 }
 
@@ -45,13 +57,15 @@ export function renderCode(token: any, ctx: RenderContext): string[] {
 	}
 	const highlighted = style.highlight(source, lang || undefined) ?? source.split("\n").map((l) => style.fg("mdCodeBlock", l));
 
-	const width = Math.max(8, ctx.width);
-	const numberWidth = state.lineNumbers ? String(highlighted.length).length + 1 : 0;
-	const gutterWidth = numberWidth > 0 ? numberWidth + 1 : 1;
-	const inner = Math.max(4, width - gutterWidth - 1);
+	const width = Math.max(1, ctx.width);
+	const requestedNumbers = state.lineNumbers ? String(highlighted.length).length + 1 : 0;
+	const numberWidth = width >= requestedNumbers + 6 ? requestedNumbers : 0;
+	const gutterWidth = numberWidth > 0 ? numberWidth + 1 : width >= 4 ? 1 : 0;
+	const rightPadding = width >= 4 ? " " : "";
+	const inner = width - gutterWidth - rightPadding.length;
 	const bg = style.codeBg;
 	const row = (gutter: string, content: string) =>
-		bg ? bg + withBackground(gutter + pad(content, inner) + " ", bg) + BG_RESET : (gutter + content).replace(/\s+$/, "");
+		bg ? bg + withBackground(gutter + pad(content, inner) + rightPadding, bg) + BG_RESET : (gutter + content).replace(/\s+$/, "");
 
 	const lines: string[] = [];
 	const note = isMermaid(lang) ? mermaidPendingNote() : "";
@@ -72,7 +86,7 @@ export function renderCode(token: any, ctx: RenderContext): string[] {
 				const n = i === 0 ? String(index + 1).padStart(numberWidth - 1) : "↪".padStart(numberWidth - 1);
 				gutter = style.fg("dim", n) + "  ";
 			} else {
-				gutter = i === 0 ? " " : style.fg("dim", "↪");
+				gutter = gutterWidth === 0 ? "" : i === 0 ? " " : style.fg("dim", "↪");
 			}
 			lines.push(row(gutter, piece));
 		});

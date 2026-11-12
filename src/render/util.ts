@@ -1,4 +1,5 @@
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { sliceByColumn, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { selectionWithFormulas } from "../math/copy.ts";
 
 export { visibleWidth };
 
@@ -6,69 +7,71 @@ export type Align = "left" | "center" | "right";
 
 /** An inline image: `\x1b[38;2;R;G;Bm` + placeholder cells + `\x1b[39m` (see math/kitty.ts). */
 const IMAGE_RUN = /(\x1b\[38;2;\d{1,3};\d{1,3};\d{1,3}m)((?:\u{10EEEE}\p{M}*)+)\x1b\[39m/gu;
-const IMAGE_CELL = /\u{10EEEE}\p{M}*/gu;
-/** Sentinels: one Supplementary-PUA-A code point per image run, repeated once per cell. */
-const SENTINEL_BASE = 0xf0000;
-const SENTINEL_RUN = /[\u{F0000}-\u{FFFFD}]+/gu;
-
-/**
- * Word-wrap text (which may contain ANSI, inline image placeholders and
- * newlines) to `width` columns.
- *
- * Inline images are swapped for plain 1-column sentinel characters while
- * wrapping: pi-tui's wrapper then treats each image as an ordinary word and
- * never has to track its escape sequences. Afterwards every sentinel run is
- * turned back into the matching placeholder cells; an image split across lines
- * keeps its correct columns on each side, because each cell encodes its column.
- */
-export function wrap(text: string, width: number): string[] {
-	const w = Math.max(1, width);
-	const images: { open: string; cells: string[]; used: number }[] = [];
-	const protectedText = text.includes("\u{10EEEE}")
-		? text.replace(IMAGE_RUN, (_m, open: string, cells: string) => {
-				const list = cells.match(IMAGE_CELL) ?? [];
-				images.push({ open, cells: list, used: 0 });
-				return String.fromCodePoint(SENTINEL_BASE + images.length - 1).repeat(list.length);
-			})
-		: text;
-
-	const out: string[] = [];
-	for (const line of protectedText.split("\n")) {
-		if (visibleWidth(line) <= w) out.push(line);
-		else out.push(...wrapTextWithAnsi(line, w).map((part) => visibleWidth(part) > w ? truncateToWidth(part, w) : part));
-	}
-	if (images.length === 0) return out;
-
-	return out.map((line) =>
-		line.replace(SENTINEL_RUN, (run) => {
-			let restored = "";
-			for (const [char, count] of runs(run)) {
-				const image = images[char.codePointAt(0)! - SENTINEL_BASE];
-				if (!image) {
-					restored += char.repeat(count);
-					continue;
-				}
-				restored += image.open + image.cells.slice(image.used, image.used + count).join("") + "\x1b[39m";
-				image.used += count;
-			}
-			return restored;
-		}),
-	);
+/** Replay the styling at the end of a line, without its visible contents. */
+function trailingStyle(line: string): string {
+	return sliceByColumn(line + " ", visibleWidth(line), 1).slice(0, -1);
 }
 
-/** Split a string into runs of the same code point. */
-function* runs(text: string): Generator<[string, number]> {
-	let current = "";
-	let count = 0;
-	for (const char of text) {
-		if (char === current) count++;
-		else {
-			if (count > 0) yield [current, count];
-			current = char;
-			count = 1;
+/** Word-wrap text, keeping each inline image an indivisible layout unit. */
+export function wrap(text: string, width: number): string[] {
+	const w = Math.max(1, width);
+	const wrapText = (value: string) => wrapTextWithAnsi(value, w)
+		.map((part) => visibleWidth(part) > w ? truncateToWidth(part, w, "�") : part);
+	if (!text.includes("\u{10EEEE}")) return wrapText(text);
+	const out: string[] = [];
+	let carry = "";
+	for (const input of text.split(/\r\n|\r|\n/)) {
+		const line = carry + input;
+		carry = trailingStyle(line);
+		if (visibleWidth(line) <= w) {
+			out.push(line);
+			continue;
 		}
+		const images = [...line.matchAll(IMAGE_RUN)];
+		if (images.length === 0) {
+			out.push(...wrapText(line));
+			continue;
+		}
+		let current = "";
+		const appendText = (value: string) => {
+			if (!value) return;
+			const used = visibleWidth(current);
+			// A non-whitespace reservation cannot be trimmed by the host wrapper.
+			// It stays on the first line, even when the following word is too wide.
+			const parts = wrapText("x".repeat(used) + trailingStyle(current) + value);
+			current += parts[0]!.slice(used);
+			for (const part of parts.slice(1)) {
+				out.push(current);
+				current = part;
+			}
+		};
+		let end = 0;
+		for (const match of images) {
+			appendText(line.slice(end, match.index));
+			const image = match[0];
+			const columns = visibleWidth(image);
+			if (columns > w) {
+				// Legacy renderers may ignore the optional width argument. Never
+				// slice their pixels; retain registered Markdown as readable text.
+				const source = selectionWithFormulas([image]);
+				appendText(source.includes("\u{10EEEE}") ? "[formula]" : source);
+			} else {
+				if (visibleWidth(current) + columns > w) {
+					// Force a normal host line break before an artificial full-width
+					// word. The host closes/reopens SGR and OSC 8 state; discard only
+					// that word and keep its continuation styling for the image.
+					const parts = wrapText(current + " " + "x".repeat(w));
+					out.push(...parts.slice(0, -1));
+					current = trailingStyle(parts.at(-1)!);
+				}
+				current += image;
+			}
+			end = match.index + image.length;
+		}
+		appendText(line.slice(end));
+		out.push(current);
 	}
-	if (count > 0) yield [current, count];
+	return out;
 }
 
 export function pad(text: string, width: number, align: Align = "left"): string {

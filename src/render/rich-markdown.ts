@@ -128,7 +128,7 @@ export class RichMarkdown implements Component {
 		const version = `${style.key}\0${this.options.math.key}\0${this.options.illustrations?.key ?? ""}\0${state.version}`;
 		if (width === this.cacheWidth && version === this.cacheVersion) return this.withFeedback();
 
-		const padding = Math.max(0, this.options.paddingX);
+		const padding = Math.min(Math.max(0, Math.floor(this.options.paddingX)), Math.max(0, Math.floor((width - 1) / 2)));
 		const contentWidth = Math.max(1, width - padding * 2);
 		let markdown = this.text;
 		try {

@@ -33,6 +33,8 @@ beforeEach(() => {
 	process.env.PI_BETTER_RENDER_FONT_DOWNLOAD = "0";
 	process.env.PI_BETTER_RENDER_MERMAID_INSTALL = "0";
 	state.enabled = state.illustrations = true;
+	state.imageBackground = "none";
+	state.imageMaxRows = 28;
 	state.math = "streaming";
 	setCellDimensions({ widthPx: 10, heightPx: 20 });
 	writes = [];
@@ -121,6 +123,97 @@ test("resize and cell-size changes fit the grid without distortion", async () =>
 	}
 });
 
+test("unchanged canvas and changed captions reuse pixels; distinct copy sources remain intact", async () => {
+	setCellDimensions({ widthPx: 9, heightPx: 20 });
+	const s = service();
+	const request = { href: png, alt: "PNG", source: `![PNG](${png})` };
+	s.block(request, 110); await s.idle();
+	const original = s.block(request, 110);
+	assert.equal(original.status, "ready");
+	assert.equal(s.stats.rasterized, 1);
+	for (const width of [109, 108, 107, 106, 105]) {
+		const resized = s.block(request, width);
+		assert.deepEqual(resized, original, "same pixel grid and source keep the same placement");
+	}
+	const second = s.block({ ...request, source: `![另一图题](${png})` }, 110);
+	assert.equal(second.status, "ready");
+	assert.equal(s.stats.rasterized, 1, "a new caption must not rasterize the PNG again");
+	if (original.status === "ready" && second.status === "ready") {
+		assert.notEqual(original.lines[0], second.lines[0]);
+		assert.ok(selectionWithFormulas(original.lines).includes(request.source));
+		assert.ok(selectionWithFormulas(second.lines).includes(`![另一图题](${png})`));
+		assert.equal(original.sourceUrl, pathToFileURL(resolve(root, png)).href);
+	}
+	s.block(request, 40);
+	assert.equal(s.stats.rasterized, 2, "a genuinely smaller canvas needs new pixels");
+	s.block(request, 110);
+	assert.equal(s.stats.rasterized, 2, "returning to the old size reuses it");
+});
+
+function lastPng(): PNG {
+	const encoded = [...writes.at(-1)!.matchAll(/\x1b_G[^;\x1b]*;([^\x1b]*)\x1b\\/g)].map((m) => m[1]).join("");
+	return PNG.sync.read(Buffer.from(encoded, "base64"));
+}
+
+test("optional image backplates preserve opaque pixels and the original file", async () => {
+	const dir = await mkdtemp(resolve(tmpdir(), "illustrated-backplate-"));
+	const input = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect x="10" y="10" width="20" height="20" fill="black"/></svg>';
+	try {
+		await writeFile(resolve(dir, "透明 图.svg"), input);
+		const s = service(dir);
+		const request = { href: "透明%20图.svg", alt: "", source: "![](透明%20图.svg)" };
+		s.block(request, 80); await s.idle();
+		const initialKey = s.key;
+		for (const [background, rgb] of [["none", undefined], ["light", [255, 255, 255]], ["dark", [23, 26, 33]]] as const) {
+			state.imageBackground = background;
+			assert.equal(s.block(request, 80).status, "ready");
+			const rendered = lastPng();
+			assert.equal(rendered.data[3], rgb ? 255 : 0);
+			if (rgb) assert.deepEqual([...rendered.data.subarray(0, 3)], [...rgb]);
+			const center = ((rendered.height / 2) * rendered.width + rendered.width / 2) * 4;
+			assert.deepEqual([...rendered.data.subarray(center, center + 4)], [0, 0, 0, 255]);
+		}
+		assert.notEqual(s.key, initialKey);
+		assert.equal(await readFile(resolve(dir, "透明 图.svg"), "utf8"), input);
+		assert.equal(s.stats.rasterized, 3);
+		state.imageBackground = "none";
+		s.block(request, 80);
+		assert.equal(s.stats.rasterized, 3, "background toggling reuses prior variants");
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("portrait height is adjustable without distortion and clear invalidates pixel variants", async () => {
+	const dir = await mkdtemp(resolve(tmpdir(), "illustrated-portrait-"));
+	try {
+		await writeFile(resolve(dir, "portrait.svg"), '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1740"><rect width="900" height="1740" fill="white"/></svg>');
+		const s = service(dir);
+		const request = { href: "portrait.svg", alt: "长图", source: "![长图](portrait.svg)" };
+		s.block(request, 110); await s.idle();
+		const compact = s.block(request, 110);
+		const oldKey = s.key;
+		state.imageMaxRows = 56;
+		const expanded = s.block(request, 110);
+		assert.notEqual(s.key, oldKey);
+		assert.equal(compact.status, "ready"); assert.equal(expanded.status, "ready");
+		if (compact.status === "ready" && expanded.status === "ready") {
+			assert.equal(compact.lines.length, 28);
+			assert.equal(expanded.lines.length, 56);
+			assert.ok(expanded.columns > compact.columns);
+			assert.equal(compact.sourceUrl, expanded.sourceUrl);
+		}
+		for (const rows of [8, 28, 56, 120]) {
+			const layout = rasterLayout(900, 1740, 110, 10, 20, rows);
+			assert.ok(Math.abs(layout.contentW / layout.contentH - 900 / 1740) < 1e-12);
+			assert.ok(layout.rows <= rows && layout.canvasW <= 4096 && layout.canvasH <= 4096);
+		}
+		s.clear();
+		assert.equal(s.stats.rasterized, 0);
+		assert.equal(s.block(request, 110).status, "fallback");
+		await s.idle(); assert.equal(s.block(request, 110).status, "ready");
+		assert.equal(s.stats.rasterized, 1);
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("frame hook restores pictures after full clear and native Kitty delete", async () => {
 	const s = service();
 	const output: string[] = [];
@@ -193,7 +286,7 @@ test("PNG preflight rejects duplicate IHDR and bounded-inflate violations, inclu
 test("cache overflow settles; placements survive source eviction and do not trigger reread loops", async () => {
 	const dir = await mkdtemp(resolve(tmpdir(), "illustrated-capacity-"));
 	try {
-		await Promise.all(Array.from({ length: 66 }, (_, i) => writeFile(resolve(dir, `${i}.svg`), '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="red"/></svg>')));
+		await Promise.all(Array.from({ length: 66 }, (_, i) => writeFile(resolve(dir, `${i}.svg`), `<svg xmlns="http://www.w3.org/2000/svg" width="${i === 65 ? 1000 : 4}" height="4"><rect width="1000" height="4" fill="red"/></svg>`)));
 		let completions = 0;
 		const s = service(dir, () => { completions++; });
 		const request = (i: number) => ({ href: `${i}.svg`, alt: "", source: `![](${i}.svg)` });
@@ -201,8 +294,14 @@ test("cache overflow settles; placements survive source eviction and do not trig
 		for (let i = 1; i < 66; i++) s.block(request(i), 10);
 		await s.idle();
 		assert.equal(s.block(request(0), 10).status, "ready", "cached placement does not need its evicted source");
-		// Also exceed placement capacity, so an evicted source can no longer use its placement.
-		for (let i = 0; i < 160; i++) s.block({ ...request(65), source: `![${i}](65.svg)` }, 10);
+		// Copy identities are cheap and distinct from pixels; exhausting them must not reread sources.
+		for (let i = 0; i < 520; i++) s.block({ ...request(65), source: `![${i}](65.svg)` }, 10);
+		// More than 128 genuinely different pixel grids/backplates also evict the first raster.
+		for (let width = 1; width <= 100; width++) s.block(request(65), width);
+		state.imageBackground = "light";
+		for (let width = 1; width <= 40; width++) s.block(request(65), width);
+		state.imageBackground = "none";
+		assert.equal(s.block(request(0), 10).status, "fallback", "evicted pixels cannot revive an evicted source");
 		const settled = completions;
 		for (let round = 0; round < 3; round++) {
 			for (let i = 0; i < 66; i++) {

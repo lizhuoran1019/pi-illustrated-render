@@ -1,6 +1,6 @@
 import { hyperlink, renderLatex } from "@earendil-works/pi-tui";
 import type { RenderContext } from "./context.ts";
-import { decodeEntities, plainText } from "./util.ts";
+import { decodeEntities, plainText, visibleWidth } from "./util.ts";
 
 /** Unicode approximation used while images are unavailable. */
 export function latexFallback(tex: string, display = false): string {
@@ -40,7 +40,7 @@ function renderInlineToken(token: any, ctx: RenderContext): string {
 		case "del":
 			return style.strike(renderInline(token.tokens, ctx));
 		case "codespan":
-			return style.fg("mdCode", decodeEntities(token.text));
+			return style.fg("mdCode", token.text);
 		case "br":
 			return "\n";
 		case "link": {
@@ -56,8 +56,8 @@ function renderInlineToken(token: any, ctx: RenderContext): string {
 		case "html":
 			return style.fg("muted", token.text ?? token.raw);
 		case "inlineMath": {
-			const image = ctx.math.inline(token.text, token.display, ctx.streaming, token.raw);
-			if (image) return image;
+			const image = ctx.math.inline(token.text, token.display, ctx.streaming, token.raw, ctx.width);
+			if (image && visibleWidth(image) <= ctx.width) return image;
 			return style.italic(style.fg("mdCode", latexFallback(token.text)));
 		}
 		case "checkbox":

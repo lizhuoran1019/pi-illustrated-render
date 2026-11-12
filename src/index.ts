@@ -98,12 +98,13 @@ function statusText(): string {
 	if (!active) return `pi-illustrated-render 未启用：${inactiveReason}`;
 	return [
 		`图文排版：${state.enabled ? "开启" : "关闭"} · 插图：${state.illustrations ? "开启" : "关闭"} · 公式：${state.math}`,
-		`图像通道：${imageMode()} · SVG/PNG：本地文件，上限 8 MiB`,
+		`插图背景：${state.imageBackground} · 预览高度：${state.imageMaxRows} 行 · 图像通道：${imageMode()}`,
+		`SVG/PNG：本地文件，上限 8 MiB · 图下链接可查看原图`,
 		`公式引擎：${mathjaxReady() ? "MathJax + resvg" : mathjaxError() ?? "加载中…"}`,
 	].join("\n");
 }
 
-const COMMANDS = ["status", "on", "off", "images:on", "images:off", "math:streaming", "math:final", "math:off", "lines", "mermaid", "refresh", "clear-cache"];
+const COMMANDS = ["status", "on", "off", "images:on", "images:off", "images:bg:light", "images:bg:dark", "images:bg:none", "images:height:28", "images:height:56", "images:height:84", "math:streaming", "math:final", "math:off", "lines", "mermaid", "refresh", "clear-cache"];
 
 export default function piIllustratedRender(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
@@ -142,12 +143,12 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 		event.systemPromptOptions.sections.illustrated_render = [
 			"The terminal displays local SVG/PNG illustrations inside assistant Markdown.",
 			"When an explanation benefits from a diagram (especially physics), create a clear standalone SVG with the available file-writing tools, then place ![short caption](/absolute/path/to/diagram.svg) in its own paragraph, with blank lines before and after. Interleave diagrams with the relevant explanation rather than collecting them at the end.",
-			"Use persistent project paths (for example .pi/diagrams/), not temporary files, so resumed sessions retain illustrations. SVGs must be self-contained vectors with no external resources, DTD or embedded images. PNG is also supported. Limits: 8 MiB, 16 million pixels. Use generous labels and a high-contrast background; the image fits within 100 columns and 28 terminal rows. Do not output raw SVG into the reply or download remote images merely to display them.",
+			`Use persistent project paths (for example .pi/diagrams/), not temporary files, so resumed sessions retain illustrations. SVGs must be self-contained vectors with no external resources, DTD or embedded images. PNG is also supported. Limits: 8 MiB, 16 million pixels. Use generous labels and a high-contrast background; the preview fits within 100 columns and ${state.imageMaxRows} terminal rows and links to the original file. Split dense or tall diagrams into focused illustrations when useful. Put complex fractions, integrals and long equations in display math rather than shrinking them into inline math. Do not output raw SVG into the reply or download remote images merely to display them.`,
 		].join("\n");
 	});
 
 	pi.registerCommand("illustrated-render", {
-		description: "图文渲染：status | on/off | images:on/off | math:streaming/final/off | refresh",
+		description: "图文渲染：status | images:on/off | images:bg:light/dark/none | images:height:56 | refresh",
 		getArgumentCompletions: (prefix) => COMMANDS.filter((value) => value.startsWith(prefix.trim()) && value !== prefix.trim()).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase() || "status";
@@ -155,6 +156,16 @@ export default function piIllustratedRender(pi: ExtensionAPI): void {
 			if (arg === "on" || arg === "off") state.enabled = arg === "on";
 			else if (arg === "images:on" || arg === "images:off") {
 				state.illustrations = arg === "images:on" && pi.getSettings().terminal?.showImages !== false;
+			} else if (arg === "images:bg:light" || arg === "images:bg:dark" || arg === "images:bg:none") {
+				state.imageBackground = arg.slice("images:bg:".length) as typeof state.imageBackground;
+			} else if (arg.startsWith("images:height:")) {
+				const value = arg.slice("images:height:".length);
+				const rows = Number(value);
+				if (!/^\d+$/.test(value) || rows < 8 || rows > 120) {
+					ctx.ui.notify("预览高度须为 8–120 行的整数，例如 /illustrated-render images:height:56", "error");
+					return;
+				}
+				state.imageMaxRows = rows;
 			} else if (arg === "math:streaming") state.math = "streaming";
 			else if (arg === "math:final") state.math = "final";
 			else if (arg === "math:off") state.math = "off";

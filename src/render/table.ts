@@ -78,8 +78,13 @@ export function renderTable(token: any, ctx: RenderContext): string[] {
 
 	const border = (s: string) => style.fg("mdCodeBlockBorder", s);
 	const rule = (l: string, m: string, r: string) => border(l + widths.map((w) => "─".repeat(w + 2)).join(m) + r);
-	const renderRow = (cells: string[], isHeader: boolean): string[] => {
-		const wrapped = widths.map((w, i) => wrap(cells[i] ?? "", w));
+	const renderRow = (cells: string[], tokenCells: any[], isHeader: boolean): string[] => {
+		const wrapped = widths.map((w, i) => {
+			const cell = cells[i] ?? "";
+			// Measurement uses the table budget; placement must use the final cell
+			// budget so formulas shrink or fall back before atomic wrapping.
+			return wrap(cell.includes("\u{10EEEE}") ? renderInline(tokenCells[i]?.tokens, { ...cellCtx, width: w }) : cell, w);
+		});
 		const height = Math.max(...wrapped.map((c) => c.length));
 		const out: string[] = [];
 		for (let line = 0; line < height; line++) {
@@ -94,8 +99,8 @@ export function renderTable(token: any, ctx: RenderContext): string[] {
 		return out;
 	};
 
-	const lines = [rule("╭", "┬", "╮"), ...renderRow(header, true), rule("├", "┼", "┤")];
-	for (const row of rows) lines.push(...renderRow(row, false));
+	const lines = [rule("╭", "┬", "╮"), ...renderRow(header, token.header, true), rule("├", "┼", "┤")];
+	rows.forEach((row, i) => lines.push(...renderRow(row, token.rows[i], false)));
 	lines.push(rule("╰", "┴", "╯"));
 	return lines;
 }
@@ -103,12 +108,13 @@ export function renderTable(token: any, ctx: RenderContext): string[] {
 function renderCards(header: string[], rows: string[][], ctx: RenderContext): string[] {
 	const { style } = ctx;
 	const lines: string[] = [];
-	const bar = style.fg("mdQuoteBorder", "▎");
+	const indent = Math.min(2, Math.max(0, ctx.width - 2));
+	const bar = indent === 2 ? style.fg("mdQuoteBorder", "▎") + " " : indent === 1 ? style.fg("mdQuoteBorder", "▎") : "";
 	rows.forEach((row, r) => {
 		if (r > 0) lines.push("");
 		header.forEach((name, i) => {
 			const label = style.bold(style.fg("mdHeading", name.replace(/\n/g, " "))) + ": ";
-			for (const line of wrap(label + (row[i] ?? ""), Math.max(1, ctx.width - 2))) lines.push(`${bar} ${line}`);
+			for (const line of wrap(label + (row[i] ?? ""), ctx.width - indent)) lines.push(bar + line);
 		});
 	});
 	return lines;
