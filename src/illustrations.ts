@@ -246,7 +246,7 @@ export class IllustrationService implements IllustrationRenderer {
 	block(image: IllustrationRequest, maxColumns: number): IllustrationResult {
 		if (!state.imagesAllowed) return { status: "fallback", message: "终端图片已关闭（terminal.showImages）" };
 		if (this.disposed || !state.illustrations) return { status: "fallback", message: "图片显示已关闭" };
-		if (imageMode() === "off") return { status: "fallback", message: "终端不支持 Kitty 图像" };
+		if (imageMode() === "off") return { status: "fallback", message: "图像通道已关闭或终端不支持 Kitty/Sixel 图像" };
 		try {
 			const originalPath = resolveImagePath(image.href, this.cwd);
 			const path = this.managed?.resolvePath(originalPath) ?? originalPath;

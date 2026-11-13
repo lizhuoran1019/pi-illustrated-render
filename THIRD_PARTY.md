@@ -24,6 +24,7 @@ Copyright (c) 2026 Jiefeng Zhou。原 MIT 许可及版权声明保留在根目�
 
 - `@resvg/resvg-js`：MIT，SVG 排版与栅格化。
 - `pngjs`：MIT，PNG 解码与 CRC 检查；解码前由本插件执行有界预检。
+- `sixel` 0.16.0：MIT，Sixel 编码、颜色量化及测试解码；来源 <https://github.com/jerch/node-sixel>，Copyright (c) Joerg Breitbart。固定版本以使用其量化子模块；未复制依赖源码。
 - `typebox`：MIT，工具参数 schema；与 Pi host 一样作为 peer dependency 使用。
 - Pi host 包作为 peer dependency，由宿主提供；开发依赖固定到实测的 Pi 1.5.2。
 

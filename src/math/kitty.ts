@@ -1,5 +1,5 @@
 /**
- * Kitty graphics protocol, in two flavours.
+ * Shared image registry and frame transport: Kitty placeholders/direct or Sixel.
  *
  * Renderers always emit Unicode placeholders: U+10EEEE cells whose truecolor
  * foreground encodes the image id and whose combining diacritics encode
@@ -19,6 +19,9 @@
  *   its own, with a placement id of its own, so a partial redraw of one row
  *   redraws exactly its slice and leaves the other slices alone.
  *
+ * - "sixel" mode (Windows Terminal 1.22+): the same placeholder grid is
+ *   rewritten to physical-pixel Sixel row slices. No Kitty escapes are sent.
+ *
  * Transmission is frame-driven: `installFrameHook` wraps pi's terminal writer
  * and sends each image the terminal does not have yet right before the frame
  * data that shows it. A full clear (ED 2/3, RIS), as pi does on resize, and
@@ -33,8 +36,10 @@
  *
  * Diacritic table: kitty's rowcolumn-diacritics.txt (via Fadouse/pi-math, MIT).
  */
-import { getCapabilities, getCellDimensions, getPngDimensions } from "@earendil-works/pi-tui";
+import { getCapabilities, getCellDimensions, getPngDimensions, type TerminalColors } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
+import { SixelCache } from "./sixel.ts";
+import { resolveSixelBackground, sgrBackground, type SixelBackground } from "./sixel-colors.ts";
 
 const DIACRITIC_CODE_POINTS = [
   0x305, 0x30d, 0x30e, 0x310, 0x312, 0x33d, 0x33e, 0x33f, 0x346, 0x34a, 0x34b, 0x34c,
@@ -93,19 +98,24 @@ export function placeholderTerminal(env: NodeJS.ProcessEnv = process.env): boole
 	return Boolean(env.KITTY_WINDOW_ID || env.GHOSTTY_RESOURCES_DIR);
 }
 
-export type ImageMode = "placeholder" | "direct" | "off";
+export type ImageMode = "placeholder" | "direct" | "sixel" | "off";
 
-/**
- * How formula images reach this terminal. PI_BETTER_RENDER_IMAGES forces a
- * mode; otherwise pi must report Kitty graphics, and terminals without
- * Unicode placeholders get direct placements.
+/** Prefer Pi's Kitty detection. Windows Terminal uses Sixel, which Pi 1.5.2
+ * does not detect itself. Multiplexers/SSH require an explicit, verified
+ * override; an inherited WT_SESSION must not enable images in an IDE terminal.
  */
 export function imageMode(env: NodeJS.ProcessEnv = process.env, kittyGraphics = getCapabilities().images === "kitty"): ImageMode {
 	const forced = env.PI_BETTER_RENDER_IMAGES?.toLowerCase();
-	if (forced === "placeholder" || forced === "direct" || forced === "off") return forced;
-	if (!kittyGraphics || env.PI_BETTER_RENDER_PLACEHOLDERS === "0") return "off";
-	if (placeholderTerminal(env)) return "placeholder";
-	return env.TMUX || env.STY ? "off" : "direct";
+	if (forced === "placeholder" || forced === "direct" || forced === "sixel" || forced === "off") return forced;
+	if (kittyGraphics) {
+		if (env.PI_BETTER_RENDER_PLACEHOLDERS === "0") return "off";
+		if (placeholderTerminal(env)) return "placeholder";
+		return env.TMUX || env.STY ? "off" : "direct";
+	}
+	const program = env.TERM_PROGRAM?.toLowerCase();
+	if (env.WT_SESSION && (!program || program === "windowsterminal") &&
+		!env.TMUX && !env.STY && !env.SSH_CONNECTION && !env.SSH_TTY && !placeholderTerminal(env)) return "sixel";
+	return "off";
 }
 
 function rgb(id: number): string {
@@ -215,6 +225,7 @@ const sent = new Set<number>();
 /** Resident images whose virtual placement exists (placeholder mode). */
 const placed = new Set<number>();
 let hooked = false;
+const sixels = new SixelCache();
 
 /** Replay recipes contain renderer arguments, never retained PNG strings. Their
  * lifetime follows the Markdown text caches; only the outgoing frame uses them.
@@ -367,7 +378,8 @@ export function registerImage(id: number, base64: string, columns: number, rows:
 	const payload = image?.payload ?? payloads.get(base64);
 	captureRegistration?.(id, { bytes: base64.length, columns, rows, payloadKey: payload?.key ?? payloadKey(base64) });
 	if (!hooked) {
-		if (!sent.has(id)) {
+		// Sixel has no upload-only operation. Wait for a frame with a position.
+		if (imageMode() !== "sixel" && !sent.has(id)) {
 			noteTransmission(id);
 			if (image) sent.add(id);
 			if (imageMode() === "direct") {
@@ -491,11 +503,12 @@ export function createDirectRewriter(): (chunk: string) => string {
 	return createFrameRewriter("direct");
 }
 
-/** Same streaming parser in both modes, including cache-miss text fallback. */
-function createFrameRewriter(mode: "direct" | "placeholder"): (chunk: string) => string {
+/** Shared streaming parser, including cache-miss text fallback in every mode. */
+function createFrameRewriter(mode: Exclude<ImageMode, "off">, getColors: () => TerminalColors = () => ({})): (chunk: string) => string {
 	let pending = "";
 	/** Image id of the current truecolor foreground, if any. */
 	let fg: number | undefined;
+	let bg: SixelBackground | undefined;
 
 	return (chunk) => {
 		const text = pending + chunk;
@@ -518,6 +531,17 @@ function createFrameRewriter(mode: "direct" | "placeholder"): (chunk: string) =>
 				// Use the default foreground, not the arbitrary RGB encoding the ID.
 				const label = runRow === 0 ? "? image unavailable" : "";
 				out += PLACEHOLDER_CLOSE + label.slice(runStart, runStart + runLength).padEnd(runLength) + placeholderOpen(runId);
+			} else if (mode === "sixel") {
+				const background = resolveSixelBackground(bg, getColors());
+				const slice = sixels.slice({ ...image.payload, columns: image.columns, rows: image.rows }, runRow, runStart, runLength, background);
+				if (slice === undefined) {
+					const label = runRow === 0 ? "? image unavailable" : "";
+					out += PLACEHOLDER_CLOSE + label.slice(runStart, runStart + runLength).padEnd(runLength) + placeholderOpen(runId);
+				} else {
+					// Sixel moves the text cursor. Save/restore it around each one-row
+					// slice, then advance exactly as the logical placeholder cells do.
+					out += `\x1b[${runLength}X\x1b7` + slice + `\x1b8\x1b[${runLength}C`;
+				}
 			} else if (mode === "placeholder") {
 				if (!placed.has(runId)) {
 					out += sent.has(runId)
@@ -563,7 +587,9 @@ function createFrameRewriter(mode: "direct" | "placeholder"): (chunk: string) =>
 				const sequence = text.slice(i, end);
 				if (sequence.endsWith("m") && sequence.startsWith("\x1b[")) {
 					fg = sgrForeground(sequence.slice(2, -1), fg);
+					if (mode === "sixel") bg = sgrBackground(sequence.slice(2, -1), bg);
 				} else {
+					if (mode === "sixel" && sequence === "\x1bc") bg = undefined;
 					RESET.lastIndex = 0;
 					const m = RESET.exec(sequence);
 					if (m && m.index === 0 && m[0].length === sequence.length) noteReset(m[0], m[1]);
@@ -686,9 +712,9 @@ interface WritableTerminal {
 }
 
 /** Wrap pi's terminal writer so images travel with the frames that show them. Returns an uninstaller. */
-export function installFrameHook(terminal: WritableTerminal, mode: ImageMode = imageMode()): () => void {
+export function installFrameHook(terminal: WritableTerminal, mode: ImageMode = imageMode(), getColors: () => TerminalColors = () => ({})): () => void {
 	const original = terminal.write;
-	const rewrite = createFrameRewriter(mode === "direct" ? "direct" : "placeholder");
+	const rewrite = createFrameRewriter(mode === "off" ? "placeholder" : mode, getColors);
 	const hook = function (this: unknown, data: string) {
 		let out = data;
 		if (typeof data === "string" && data.length > 0) {
@@ -715,6 +741,7 @@ export function installFrameHook(terminal: WritableTerminal, mode: ImageMode = i
  * placeholders already on screen and in the scrollback keep their images.
  */
 export function forgetImages(): void {
+	sixels.clear();
 	sent.clear();
 	placed.clear();
 	registry.clear();

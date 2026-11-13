@@ -22,14 +22,17 @@ const message = (text: string): Message => ({ role: "assistant", content: [{ typ
 const render = (c: AssistantMessageComponent) => c.render(90).map(stripTerminalSequences).join("\n");
 
 const initialAgentDir = process.env.PI_CODING_AGENT_DIR;
+const initialImageMode = process.env.PI_BETTER_RENDER_IMAGES;
 let agentDir: string;
 beforeEach(async () => {
 	agentDir = await mkdtemp(join(tmpdir(), "pi-diagram-hooks-"));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_BETTER_RENDER_IMAGES = "placeholder";
 	initTheme("dark"); state.enabled = state.imagesAllowed = state.illustrations = true; state.math = "streaming"; state.imageBackground = "none"; state.imageMaxRows = 28;
 });
 afterEach(async () => {
 	removePatch(); AssistantMessageComponent.prototype.updateContent = original;
+	if (initialImageMode === undefined) delete process.env.PI_BETTER_RENDER_IMAGES; else process.env.PI_BETTER_RENDER_IMAGES = initialImageMode;
 	if (initialAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = initialAgentDir;
 	await rm(agentDir, { recursive: true, force: true });
 });
@@ -201,7 +204,7 @@ test("terminal image permission covers math and illustrations, including cached 
 	setCellDimensions({ widthPx: 8, heightPx: 16 });
 	assert.ok(await loadMathJax());
 	try {
-		for (const mode of [undefined, "placeholder", "direct"]) {
+		for (const mode of [undefined, "placeholder", "direct", "sixel"]) {
 			if (mode === undefined) delete process.env.PI_BETTER_RENDER_IMAGES; else process.env.PI_BETTER_RENDER_IMAGES = mode;
 			const h = await terminalHarness(false);
 			try {
@@ -210,7 +213,7 @@ test("terminal image permission covers math and illustrations, including cached 
 				const component = new AssistantMessageComponent(stored);
 				const disabled = () => {
 					const output = h.frame(component);
-					assert.ok(!output.includes(PLACEHOLDER) && !output.includes("\x1b_G"));
+					assert.ok(!output.includes(PLACEHOLDER) && !output.includes("\x1b_G") && !output.includes("\x1bP"));
 					assert.match(stripTerminalSequences(output), /终端图片已关闭/);
 					assert.ok(!h.prompt().illustrated_render);
 				};
@@ -222,7 +225,7 @@ test("terminal image permission covers math and illustrations, including cached 
 				h.settings.terminal.showImages = true;
 				await h.run("images:off");
 				const allowed = h.frame(component);
-				assert.ok(allowed.includes("\x1b_Ga="), "images:off must not turn off formula images");
+				assert.ok(allowed.includes(mode === "sixel" ? "\x1bP" : "\x1b_Ga="), "images:off must not turn off formula images");
 				assert.match(stripTerminalSequences(allowed), /图片显示已关闭/);
 				h.settings.terminal.showImages = false; disabled();
 				h.settings.terminal.showImages = true;
@@ -235,6 +238,30 @@ test("terminal image permission covers math and illustrations, including cached 
 		setCapabilities(caps);
 		if (previous === undefined) delete process.env.PI_BETTER_RENDER_IMAGES; else process.env.PI_BETTER_RENDER_IMAGES = previous;
 	}
+});
+
+test("Sixel reaches the actual assistant writer for diagrams and formulas without changing source", async () => {
+	process.env.PI_BETTER_RENDER_IMAGES = "sixel";
+	setCellDimensions({ widthPx: 8, heightPx: 16 });
+	assert.ok(await loadMathJax());
+	const h = await terminalHarness(true);
+	try {
+		const stored = message("$x+y$\n\n![diagram](examples/electric-field.png)");
+		const snapshot = JSON.stringify(stored);
+		const component = new AssistantMessageComponent(stored);
+		let output = h.frame(component);
+		for (let i = 0; i < 100 && stripTerminalSequences(output).includes("图片加载中"); i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			output = h.frame(component);
+		}
+		assert.ok((output.match(/\x1bP/g) ?? []).length > 1, "formula and diagram slices");
+		assert.ok(!output.includes(PLACEHOLDER) && !output.includes("\x1b_G"));
+		assert.match(stripTerminalSequences(output), /查看原图/);
+		await h.run("status"); assert.match(h.notices.at(-1)!, /图像通道：sixel/);
+		await h.run("images:off"); await h.run("math:off");
+		assert.ok(!h.frame(component).includes("\x1bP"));
+		assert.equal(JSON.stringify(stored), snapshot);
+	} finally { h.stop(); }
 });
 
 test("direct fullscreen frames reset only on real renders and release their instance hook", () => {

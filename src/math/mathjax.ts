@@ -31,11 +31,17 @@ export interface RasterRequest {
 	/** Force the result into this many rows (1 for inline formulas). */
 	maxRows: number;
 	fitRows?: boolean;
+	/** Sixel inline text: shared font size and baseline, never per-formula centering/shrinking. */
+	inlineLayout?: "text";
 }
 
 export class MathError extends Error {}
 
 const EX_TO_CELL = 0.5;
+// One fixed text size leaves space for vector accents and ordinary descenders.
+// Baseline is a terminal-font approximation; glyph bounding boxes are not baselines.
+const INLINE_EX_TO_CELL = 0.32;
+const INLINE_BASELINE_TO_CELL = 0.8;
 const MAX_CANVAS = 4096;
 const BLEED = 1;
 
@@ -187,10 +193,10 @@ export function checkTex(tex: string, display: boolean): void {
 	svgFor(tex, display);
 }
 
-/** Wrap any SVG body so it is centered on a canvas of exact pixel size. */
-export function centeredCanvas(inner: string, contentW: number, contentH: number, canvasW: number, canvasH: number, color: string): string {
+/** Wrap an SVG on an exact cell canvas. An explicit top aligns an inline baseline. */
+export function centeredCanvas(inner: string, contentW: number, contentH: number, canvasW: number, canvasH: number, color: string, top?: number): string {
 	const x = Math.max(0, (canvasW - contentW) / 2);
-	const y = Math.max(0, (canvasH - contentH) / 2);
+	const y = top ?? Math.max(0, (canvasH - contentH) / 2);
 	return (
 		`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${canvasW}" height="${canvasH}" viewBox="0 0 ${canvasW} ${canvasH}" color="${color}">` +
 		inner.replace(/^<svg\b/, `<svg x="${x}" y="${y}" overflow="visible"`).replace(/\s(width|height)="[\d.]+ex"/g, (_m, dim) => ` ${dim}="${dim === "width" ? contentW : contentH}"`) +
@@ -225,22 +231,40 @@ export function rasterize(req: RasterRequest): Raster {
 	const maxH = req.maxRows * cellH - BLEED * 2;
 	if (maxW <= 0 || maxH <= 0) throw new MathError("no room");
 
-	const base = cellH * EX_TO_CELL;
+	const textInline = req.inlineLayout === "text" && !req.display && req.fitRows && req.maxRows === 1;
+	// A terminal line has fixed height. Leave room for accents above and
+	// descenders below a shared baseline, rather than enlarging bare letters
+	// and independently shrinking/centering every accented/scripted formula.
+	const base = cellH * (textInline ? INLINE_EX_TO_CELL : EX_TO_CELL);
 	let pxPerEx = Math.min(base, maxW / widthEx);
-	if (req.fitRows) pxPerEx = Math.min(pxPerEx, maxH / heightEx);
+	let top: number | undefined;
+	if (textInline) {
+		const box = /\bviewBox="([^"]+)"/.exec(svg)?.[1]?.trim().split(/\s+/).map(Number);
+		if (!box || box.length !== 4 || !box.every(Number.isFinite) || box[3]! <= 0) throw new MathError("raster without baseline");
+		// MathJax places y=0 at the math baseline. viewBox carries the ascent
+		// and descent, even for formulas whose glyphs sit wholly above/below it.
+		const ascent = -box[1]! / box[3]! * heightEx * base;
+		top = cellH * INLINE_BASELINE_TO_CELL - ascent;
+		if (widthEx * base > maxW || top < 0.25 || top + heightEx * base > cellH - 0.25) {
+			// A stacked fraction/large operator does not belong in one text row.
+			// Use the existing Unicode/source fallback; do not squash it to fit.
+			throw new MathError("no room for inline baseline");
+		}
+		pxPerEx = base;
+	} else if (req.fitRows) pxPerEx = Math.min(pxPerEx, maxH / heightEx);
 	// Shrinking below ~55% makes formulas unreadable: prefer the text fallback.
 	if (pxPerEx < base * 0.55) throw new MathError("formula too large for the terminal");
 
 	const contentW = widthEx * pxPerEx;
 	const contentH = heightEx * pxPerEx;
 	const columns = Math.max(1, Math.min(req.maxColumns, Math.ceil((contentW + BLEED * 2) / cellW - 1e-9)));
-	const rows = Math.max(1, Math.ceil((contentH + BLEED * 2) / cellH - 1e-9));
+	const rows = textInline ? 1 : Math.max(1, Math.ceil((contentH + BLEED * 2) / cellH - 1e-9));
 	if (rows > req.maxRows) throw new MathError(`formula needs ${rows} rows`);
 
 	const scale = deviceScale(cellH);
 	const canvasW = Math.ceil(columns * cellW * scale);
 	const canvasH = Math.ceil(rows * cellH * scale);
 	if (canvasW > MAX_CANVAS || canvasH > MAX_CANVAS) throw new MathError("raster too large");
-	const png = rasterizeSvg(centeredCanvas(svg, contentW * scale, contentH * scale, canvasW, canvasH, req.color));
+	const png = rasterizeSvg(centeredCanvas(svg, contentW * scale, contentH * scale, canvasW, canvasH, req.color, top === undefined ? undefined : top * scale));
 	return { base64: png.toString("base64"), columns, rows };
 }

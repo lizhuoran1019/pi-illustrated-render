@@ -87,7 +87,9 @@ test("$$math$$ labels use bundled MathJax paths, including fractions and Chinese
 		const diagram = await renderDiagram({ format: "mermaid", source });
 		assert.doesNotMatch(diagram.svg, /\$\$|data-latex|katex/i);
 		assert.ok((diagram.svg.match(/<path\b/g) ?? []).length >= 5);
-		assert.ok(colorCount(raster(diagram), [31, 31, 31]) > 50);
+		// Thin glyphs may be entirely antialiased with a different system CJK
+		// font. Count dark coverage too, while excluding the light node fill.
+		assert.ok(colorCount(raster(diagram), [31, 31, 31], 70) > 50);
 	}
 	await assert.rejects(renderDiagram({ format: "mermaid", source: String.raw`flowchart LR
  A["$$\notARealCommand$$"]` }), /Undefined control sequence/);

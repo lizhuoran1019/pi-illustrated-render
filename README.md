@@ -6,7 +6,7 @@
 
 ## 先试用，不改现有配置
 
-要求：**Pi 1.5.2、Node.js 22.19+、Kitty 图像协议终端**。已在 Linux / Kitty 0.50.0 中实测；其他终端未做实机验证。不支持图像时显示说明和文件路径。
+要求：**Pi 1.5.2、Node.js 22.19+、Kitty 图像协议终端或 Windows Terminal 1.22+（Sixel）**。Kitty 通道已在 Linux / Kitty 0.50.0 中实测；Sixel 已在 Windows Terminal 1.24.12741.0 / WSL 中实机复核行内公式、中文列表、重载、窗口缩放和滚动，其他终端配置仍需验证。不支持图像时显示说明和文件路径。
 
 克隆仓库、安装依赖，然后开启临时会话：
 
@@ -32,6 +32,41 @@ pi --no-session --no-tools --no-extensions -e ./src/index.ts -e ./tools/visual-f
 ```
 
 进入 Pi 后输入 `/visual-fixture`。这会用真实的助手组件展示 `examples/physics.md`，包含两幅 SVG、一个 PNG、公式和表格，无需 API 调用。此演示扩展仅用于验证，不要加入日常扩展列表。
+
+## Windows Terminal + WSL
+
+**Windows Terminal 使用 Sixel，不支持 Kitty 图像协议。** 在 Windows Terminal 1.22+ 中直接启动 WSL 和 Pi，插件依据 `WT_SESSION` 自动选择 `sixel`；不需要安装 Kitty、ImageMagick 或 `img2sixel`。自动识别不检查 Windows Terminal 的版本，旧版本需先升级。
+
+更新插件和运行依赖后，在 Pi 中输入：
+
+```text
+/reload
+/illustrated-render status
+```
+
+应显示 **图像通道：sixel**。若环境变量丢失，但已确认终端支持 Sixel，可在 WSL 中显式启动：
+
+```bash
+env PI_BETTER_RENDER_IMAGES=sixel pi
+```
+
+- 不要设置 `PI_IMAGE_PROTOCOL=kitty`：那会使 Pi 原生图片发送错误协议。
+- 自动识别避开 tmux、screen、SSH 和继承了 `WT_SESSION` 的 IDE 终端。只有确认整条链路支持 Sixel 后才使用强制开关；这些组合尚未实测。
+- `terminal.showImages` 仍是图片总开关。此后端只接管本插件的插图和公式，不会给 Pi 原生工具图片增加 Sixel 支持。
+- 启动及窗口/字体尺寸改变时查询字符格的像素大小，避免把 2× 栅格直接画成两倍大小。
+- Sixel 行内公式使用统一字号和基线，不再按每个公式的外框独立居中、缩放。向量和上下标留在各自文本行内；单行容不下的分式或大公式使用文字回退，建议改写成独立公式块。Kitty 和独立公式块的排版不变。
+- Sixel 的半透明边缘按终端背景色或当前文本区域的底色合成，保留平滑抗锯齿，不再用透明散点近似；完全透明的空白仍透明，不给每个公式加矩形底板。Kitty 的透明 PNG 路径不变。
+- 背景色和 ANSI 调色板通过 Pi 的终端颜色查询获取；终端外观切换及延迟回复会触发重绘，缓存区分背景颜色。无法查询背景色时，依据当前 Pi 主题使用黑色或白色回退。
+- Sixel 仍只有最多 256 色和二值透明度。透明/亚克力窗口的实际桌面混合色无法查询，边缘颜色可能稍有偏差；不透明终端背景更接近 Kitty 的效果，原始 SVG 则保留完整画质。全屏模式完整重绘视口以清除旧图片，传输量高于 Kitty。
+- `clear-cache` 会丢弃本地 Sixel 缓存并重绘；Sixel 没有按图像 ID 删除的命令，不会删除普通模式终端滚动历史里的旧图片。
+
+无需模型即可验收：从本仓库目录启动上面的演示，依次测试 `/visual-fixture`、`/visual-fixture stream`、上下滚动、改变窗口大小、切换浅色主题，以及 `images:off` / `math:off` 后是否有旧图残留。
+
+WSL 的 `file:///home/…` 链接不一定能由 Windows 直接打开。需要查看原图时，可在 WSL 中打开默认缓存目录：
+
+```bash
+explorer.exe "$(wslpath -w ~/.pi/agent/cache/pi-illustrated-render/diagrams)"
+```
 
 ## 正式启用
 
@@ -137,13 +172,14 @@ Pi 的 **`terminal.showImages` 是图片总开关**：关闭后，公式使用�
 - 不自动下载 HTTP 图片，不接受 SVG 的外部文件、嵌入图片、DTD 或实体声明。图片缺失、格式损坏或终端不支持时，保留说明、原因和路径。
 - 改动图片后用 `refresh`；插件不持续监视文件。源缓存保留最多 64 张图或 32 MiB，栅格缓存最多 128 个布局或 32 MiB。最终像素布局不变时，调整窗口宽度或更换图题会复用图像，不重复栅格化；每个图题仍保留自己的复制来源。超出容量的旧图可能退回文字与路径，不会持续反复读取。
 - 终端传输缓存最多保留 **64 MiB 的 Base64 PNG 载荷、4000 个图像 ID**。相同像素共享数据，不合并复制来源。旧图再次进入实际输出画面时，会尝试自动恢复；一帧所需图像超过容量、或源数据已不可用时，超出的图像区域稳定显示 `? image unavailable`，不会反复重绘。插图的图题、原图链接仍可使用；`refresh` 可重新构建缓存。
-- **全屏 TUI 内的选择复制**会把图片还原成可用的 Markdown；引用式图片会补全目的路径。普通终端自身的鼠标复制仍可能得到 Kitty 占位字符。
+- Sixel 另有最多 **16 MiB / 64 个栅格**和 **16 MiB / 1024 个编码切片**的有界缓存；缩放和编码只在缓存未命中时执行。
+- **全屏 TUI 内的选择复制**会把图片还原成可用的 Markdown；引用式图片会补全目的路径。普通终端自身的鼠标复制不能还原图片，Kitty 下还可能得到占位字符。
 - 修改的是显示组件，不会用终端图像数据替换会话里的原始 Markdown。RPC/非 TUI 模式不接管渲染。
 - 为复用上游配置，公式和图像通道仍兼容 `PI_BETTER_RENDER_*` 环境变量。`PI_BETTER_RENDER_IMAGES=off` 会关闭图像通道。需要完全禁止上游可选资源下载时，启动时设置 `PI_BETTER_RENDER_FONT_DOWNLOAD=0` 和 `PI_BETTER_RENDER_MERMAID_INSTALL=0`。插图本身不下载字体。
 
-默认使用 Kitty 占位符图像通道，保留增量重绘。若手动启用 `PI_BETTER_RENDER_IMAGES=direct`，全屏模式会完整重绘视口，并重新发送原生工具图片，以避免滚动或关闭插图后残留旧图层；这种兼容模式的传输开销更大，日常使用建议保持默认。
+自动选择当前终端的通道：Kitty / Ghostty 使用占位符并保留增量重绘，其他 Pi 已识别的 Kitty 协议终端使用 direct，Windows Terminal 使用 Sixel。`PI_BETTER_RENDER_IMAGES=placeholder|direct|sixel|off` 可显式覆盖。direct / Sixel 在全屏模式完整重绘视口，以避免滚动或关闭插图后残留旧图层；direct 同时重新发送原生工具图片。这两种通道的传输开销更大。
 
-Pi 暂未提供助手 Markdown 组件替换 API，因此仍采用上游的组件补丁方式，保留原生 Markdown slot 和显示变换。direct 全屏模式还使用 Pi 的内部帧重绘钩子。Pi 升级后应先在临时会话验证，再用于日常会话。
+Pi 暂未提供助手 Markdown 组件替换 API，因此仍采用上游的组件补丁方式，保留原生 Markdown slot 和显示变换。direct / Sixel 全屏模式还使用 Pi 的内部帧重绘钩子。Pi 升级后应先在临时会话验证，再用于日常会话。
 
 ## 开发与检查
 
@@ -153,6 +189,8 @@ npm run check
 ```
 
 自动测试覆盖图文顺序、流式语法、引用路径、长宽比、底板像素、长图高度、缓存复用与溢出、复制、PNG 解码限制、丢失文件恢复、终端清屏、组件生命周期、原文不变和渲染器冲突。还验证实体字符不能注入终端控制序列、图片总开关约束缓存输出、重复 PNG 共享传输缓存、真实容量溢出时的稳定降级、缓存正文再次显示时的恢复，以及 direct 全屏重绘钩子的安装与释放。
+
+Sixel 回归测试覆盖协议选择、逐像素解码、2× 栅格缩放、透明度与预乘颜色、256 色量化、切片缓存上限、分段写入、缓存恢复和字符格查询，还使用真正的 `TuiAltScreen` 检查滚动裁剪、尺寸变化与关闭图像时的清屏。另有 16/20/24/32/40 像素行高的基线、字号、上下标、中文列表窄屏换行和跨通道缓存回归。测试不等于 Windows Terminal 实机截图验收。
 
 布局回归测试覆盖中文代码换行、中文标点、嵌套窄窗口、行内代码原文、提示块引用、流式嵌套引用定义、只有表头的表格、完整公式换行，以及换行后文字、样式和链接的保留。
 

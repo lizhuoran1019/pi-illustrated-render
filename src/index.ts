@@ -2,6 +2,7 @@
 import { type ExtensionAPI, type ExtensionContext, copyToClipboard, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { IllustrationService } from "./illustrations.ts";
 import { installDirectRedraw } from "./direct-redraw.ts";
+import { createSixelColorSource, installSixelCellSize, type SixelColorHost } from "./sixel-terminal.ts";
 import { registerDiagramTools } from "./diagrams/tools.ts";
 import { forgetFormulaSources, installCopyHook, type SelectionHost } from "./math/copy.ts";
 import { createMathRenderer, clearFormulaCache } from "./math/formula.ts";
@@ -14,10 +15,12 @@ import { bumpVersion, setRenderRequester, state } from "./state.ts";
 import { createStyle, plainStyle, type Style, styleKey } from "./style.ts";
 
 let ui: ExtensionContext["ui"] | undefined;
-let tui: { mode?: string; requestRender?: () => void; invalidate?: () => void; terminal?: { write(data: string): void } } | undefined;
+let tui: (SixelColorHost & { mode?: string; requestRender?: () => void; invalidate?: () => void; terminal?: { write(data: string): void } }) | undefined;
 let uninstallFrameHook: (() => void) | undefined;
 let uninstallCopyHook: (() => void) | undefined;
 let uninstallDirectRedraw: (() => void) | undefined;
+let uninstallSixelCellSize: (() => void) | undefined;
+let uninstallSixelColors: (() => void) | undefined;
 let illustrations: IllustrationService | undefined;
 let active = false;
 let lifecycle = 0;
@@ -62,7 +65,9 @@ function stop(): void {
 	uninstallFrameHook?.();
 	uninstallCopyHook?.();
 	uninstallDirectRedraw?.();
-	uninstallFrameHook = uninstallCopyHook = uninstallDirectRedraw = undefined;
+	uninstallSixelCellSize?.();
+	uninstallSixelColors?.();
+	uninstallFrameHook = uninstallCopyHook = uninstallDirectRedraw = uninstallSixelCellSize = uninstallSixelColors = undefined;
 	illustrations?.dispose();
 	dropCaches(false);
 	illustrations = undefined;
@@ -85,9 +90,15 @@ function captureTui(ctx: ExtensionContext): boolean {
 	}
 	if (!tui?.terminal) return false;
 	setRenderRequester(refreshAll);
-	uninstallFrameHook = installFrameHook(tui.terminal);
+	const colors = createSixelColorSource(tui, () => {
+		const channel = ui?.theme?.appearance === "light" ? 255 : 0;
+		return { r: channel, g: channel, b: channel };
+	}, refreshAll);
+	uninstallSixelColors = colors.dispose;
+	uninstallFrameHook = installFrameHook(tui.terminal, imageMode(), colors.read);
 	uninstallDirectRedraw = installDirectRedraw(tui);
 	uninstallCopyHook = installCopyHook(tui as SelectionHost);
+	uninstallSixelCellSize = installSixelCellSize(tui.terminal);
 	return true;
 }
 

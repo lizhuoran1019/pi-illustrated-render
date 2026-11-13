@@ -136,12 +136,13 @@ export function createMathRenderer(getColor: () => string): MathRenderer {
 		const color = getColor();
 		const cell = getCellDimensions();
 		const columns = Math.min(maxColumns, MAX_PLACEHOLDER_CELLS);
-		const key = `${display ? "D" : "I"}\0${columns}\0${maxRows}\0${cell.widthPx}x${cell.heightPx}\0${color}\0${tex}`;
+		const textInline = !display && imageMode() === "sixel";
+		const key = `${display ? "D" : textInline ? "T" : "I"}\0${columns}\0${maxRows}\0${cell.widthPx}x${cell.heightPx}\0${color}\0${tex}`;
 		let entry = rasters.get(key);
 		if (!entry) {
 			const started = performance.now();
 			try {
-				const raster = rasterize({ tex, display, color, cellWidth: cell.widthPx, cellHeight: cell.heightPx, maxColumns: columns, maxRows, fitRows: !display });
+				const raster = rasterize({ tex, display, color, cellWidth: cell.widthPx, cellHeight: cell.heightPx, maxColumns: columns, maxRows, fitRows: !display, inlineLayout: textInline ? "text" : undefined });
 				entry = remember(key, { ...raster, id: allocateId() });
 				mathStats.rendered++;
 			} catch (error) {

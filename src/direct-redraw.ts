@@ -7,9 +7,9 @@ interface FrameHost {
 	uploadedKittyImages?: Map<number, unknown>;
 }
 
-/** Direct placements live outside Kitty's text grid. Pi cannot see them in its
+/** Direct placements and Sixel pixels live outside Pi's text grid. Pi cannot see them in its
  * logical placeholder lines, so a differential redraw can leave old slices over
- * new text. In this opt-in compatibility mode, let Pi redraw its whole viewport
+ * new text. For these compatibility transports, let Pi redraw its whole viewport
  * (including native images) instead. No extra frame is requested.
  *
  * These protected instance hooks are checked against Pi 1.5.2, like the assistant
@@ -18,10 +18,10 @@ interface FrameHost {
  */
 export function installDirectRedraw(tui: unknown, mode: ImageMode = imageMode()): () => void {
 	const host = tui as FrameHost;
-	if (mode !== "direct" || host.mode !== "fullscreen") return () => {};
+	if ((mode !== "direct" && mode !== "sixel") || host.mode !== "fullscreen") return () => {};
 	const render = host.doRender, reset = host.resetRenderState;
 	if (typeof render !== "function" || typeof reset !== "function") {
-		throw new Error("当前 Pi 不支持 direct 模式的完整视口重绘；请使用默认 placeholder 模式");
+		throw new Error(`当前 Pi 不支持 ${mode} 模式的完整视口重绘；请更新 Pi，或在 Kitty 终端使用 placeholder 模式`);
 	}
 	let active = true;
 	const hook = function (this: FrameHost) {
